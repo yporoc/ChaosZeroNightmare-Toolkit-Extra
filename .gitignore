@@ -1,0 +1,31 @@
+# === 构建产物 ===
+build/
+dist/
+*.spec.bak
+nuitka-crash-report.xml
+ChaosZero-Toolkit.exe
+ChaosZero-Toolkit*.zip
+ChaosZero-Toolkit-release.zip
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === 工具运行时产物（不入库） ===
+SPEED_LOG.txt
+speed_config.txt
+unpacked/
+bundle_rebuilt.pack
+bin_full_rebuild/
+bin_rebuilt/
+
+# === 游戏数据包（体积大，禁止入库） ===
+*.pack
+*.pack~*
+*.plpck
+bin/
+
+# === 系统 / 编辑器 ===
+Thumbs.db
+.DS_Store

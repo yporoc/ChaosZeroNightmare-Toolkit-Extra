@@ -1,0 +1,8 @@
+# ChaosZero Toolkit 依赖（版本为本机验证通过的组合，锁版本以保证可复现构建）
+#
+# 注意：代码中 `import opencc`，对应的 PyPI 包名是 opencc-python-reimplemented，
+#       直接写 `opencc` 会安装失败（PyPI 上另有同名但不兼容的包）。
+numpy==2.5.2
+customtkinter==6.0.0
+opencc-python-reimplemented==0.1.7
+pefile==2024.8.26
