@@ -29,6 +29,10 @@ import struct
 import string
 import hashlib
 import traceback
+import glob
+import json
+import stat
+import ctypes
 
 # ═══════════════════════════════════════════════════════════════════════
 # 主题配置
@@ -55,6 +59,29 @@ GLOBAL_FONT = ("Microsoft YaHei UI", "Segoe UI")
 GAME_EXE_NAME     = "ssr-stove-shield.exe"
 GAME_FOLDER_NAME  = "ChaosZeroNightmare"
 
+# ---- 游戏目录定位相关常量 ----
+GAME_ID_HINT   = "STOVE_CHAOSZERO"
+# 唯一的硬判据：bin 下必须有本工具要补丁的那个 exe。其余都只用来定位候选。
+GAME_ANCHOR_REL = os.path.join("bin", GAME_EXE_NAME)
+# 目录名只是线索：STOVE 清单里写的是 ChaosZero，实机目录却是 ChaosZeroNightmare
+GAME_ROOT_NAMES = [GAME_FOLDER_NAME, "ChaosZero"]
+SGUP_APPS_SUB   = r"SOFTWARE\SGUP\apps"
+SGUP_ACTIVE_SUB = r"SOFTWARE\SGUP\activeProcess"
+UNINSTALL_SUB   = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+STOVE_MANIFEST_SUB = os.path.join("STOVE", "GameManifest")
+COMBINED_MANIFEST_SUB = os.path.join("bin", "appdata", "cznlive")  # = _detect_game_files 里的 pack_dir
+# 扫盘预算：默认 5 层足够覆盖盘符下「任意父目录\游戏名」；勾选深度搜索放到 8
+BFS_MAX_LEVELS  = 5
+BFS_DEEP_LEVELS = 8
+# AppData 是成本主项：实测不剪它比剪掉慢 40~110 倍，且游戏不可能装在那里
+BFS_PRUNE_PREFIX = ("$", "#", "appdata", "windows", "programdata", "recovery",
+                    "perflogs", "system volume", "onedrive", "node_modules",
+                    ".git", "msocache", "$recycle")
+# 出现这些字样更像是手工拷贝/下载残留，参与打分时降权（不作硬性排除）
+COPY_HINT_TOKENS = ("desktop", "downloads", "onedrive", "appdata", "sandbox",
+                    "副本", "备份", "copy", "-old", "_old", "backup", "\\bak")
+SETTINGS_NAME = "toolkit_settings.json"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包后，exe 实际运行目录（而非临时解压目录）
 # Nuitka: __nuitka_binary_dir 或 __compiled__；PyInstaller: sys.frozen
@@ -62,6 +89,11 @@ if "__compiled__" in dir() or hasattr(sys, 'frozen'):
     EXE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 else:
     EXE_DIR = SCRIPT_DIR
+
+# 兄弟模块（embedded_bundle_patcher / rebuild_ko_to_zht 等）是按目录名导入的，
+# 启动期的目录检测就会用到，这里先把本目录挂上，免得依赖运行时的 import 顺序。
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 
 class LogRedirector:
@@ -76,6 +108,444 @@ class LogRedirector:
 
     def flush(self):
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 游戏目录定位 —— 只用标准库、不碰 GUI，可自测：python chaoszero_toolkit_gui.py --locate-selftest
+#
+# 顺序即优先级：先问「写下这条路径的人」（工具同级 / 注册表 / STOVE 清单），最后才扫盘。
+# 不能找到第一个就收工：一台机器可能有多份体积分卷都相同的完整副本，首个命中往往是
+# 桌面上的旧拷贝，补丁会打到不玩的那份 —— 所以先收齐候选再打分（score_candidate）。
+# ═══════════════════════════════════════════════════════════════════════
+
+def has_bin_exe(bin_path):
+    """bin 目录里有没有本工具要补丁的 exe —— 唯一的硬判据。"""
+    return bool(bin_path) and os.path.isfile(os.path.join(bin_path, GAME_EXE_NAME))
+
+
+def has_anchor(root):
+    """游戏根目录下有没有 bin\\<exe>。"""
+    return has_bin_exe(os.path.join(root, "bin")) if root else False
+
+
+def normalize_game_path(raw):
+    """任意写法收敛成游戏根目录，返回 (root, 修正说明)：注册表 / 手打 / askdirectory
+    给的斜杠路径、引号、%VAR%、指到 bin、指到 exe 都在此一次收敛。"""
+    notes = []
+    if not raw:
+        return "", notes
+    text = str(raw).strip().strip('"').strip("'").strip()
+    if not text:
+        return "", notes
+    if text != str(raw).strip():
+        notes.append("去掉首尾空白/引号")
+    text = os.path.expandvars(os.path.expanduser(text))
+    if os.name == "nt":
+        if "/" in text:
+            text = text.replace("/", "\\")
+            notes.append("正斜杠已转为反斜杠")
+        if len(text) > 3:
+            text = text.rstrip("\\")
+    root = os.path.normpath(text)
+    if root != text:
+        notes.append("normpath 归一")
+    if root.lower().endswith(".exe"):
+        root = os.path.dirname(os.path.dirname(root))
+        notes.append("由 exe 路径上跳两级取游戏根")
+    elif os.path.basename(root).lower() == "bin":
+        root = os.path.dirname(root)
+        notes.append("由 bin 目录上跳一级取游戏根")
+    return root, notes
+
+
+def _add_name(names, candidate):
+    """把注册表/清单里读到的目录名并入候选（只收真正像目录名的）。"""
+    name = str(candidate or "").strip().strip('"').strip("'")
+    if name and len(name) > 2 and not any(sep in name for sep in "\\/:*?\"<>|"):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def list_drives():
+    """只取本地盘（固定+可移动）。不能用 os.path.exists("Z:\\") 裸判：
+    离线映射盘能阻塞几十秒，光驱还可能弹「请插入磁盘」。"""
+    wanted = {3, 2}
+    out = []
+    try:
+        get_type = ctypes.windll.kernel32.GetDriveTypeW
+    except (AttributeError, OSError):
+        get_type = None
+    for letter in string.ascii_uppercase:
+        root = letter + ":\\"
+        if get_type is None:
+            if os.path.exists(root):
+                out.append(root)
+            continue
+        try:
+            if get_type(root) in wanted:
+                out.append(root)
+        except OSError:
+            continue
+    return out
+
+
+def is_reparse_point(path):
+    """目录联接 / 符号链接。os.walk 会跟进 junction，同一棵树因此被扫两遍。"""
+    try:
+        return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except (OSError, AttributeError):
+        return False
+
+
+def read_registry_records(trace):
+    """一次读齐注册表里的全部相关记录（毫秒级），任何一键缺失都不该抛异常。"""
+    rec = {"apps": [], "uninstall": [], "launcher": []}
+    if os.name != "nt":
+        trace.append("注册表: 跳过（非 Windows）")
+        return rec
+    try:
+        import winreg
+    except ImportError:
+        trace.append("注册表: winreg 不可用")
+        return rec
+
+    def _values(hive, sub, view=0):
+        out = {}
+        try:
+            with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | view) as key:
+                info = winreg.QueryInfoKey(key)
+                out["__subkeys__"] = [winreg.EnumKey(key, i) for i in range(info[0])]
+                for i in range(info[1]):
+                    name, value, _type = winreg.EnumValue(key, i)
+                    out[name] = value
+        except OSError:
+            pass
+        return out
+
+    # ① 官方安装器写的 GamePath。枚举 apps\* 而不是写死 game_id，换平台/换 ID 不至于全瞎
+    app_keys = _values(winreg.HKEY_CURRENT_USER, SGUP_APPS_SUB).get("__subkeys__", [])
+    for game_id in app_keys:
+        vals = _values(winreg.HKEY_CURRENT_USER, SGUP_APPS_SUB + "\\" + game_id)
+        if vals.get("GamePath"):
+            rec["apps"].append((game_id, vals["GamePath"], str(vals.get("ExeName", ""))))
+    if not rec["apps"]:
+        trace.append("注册表: %s 下没有 GamePath（共 %d 个子键）" % (SGUP_APPS_SUB, len(app_keys)))
+
+    vals = _values(winreg.HKEY_CURRENT_USER, SGUP_ACTIVE_SUB)
+    if vals.get("WorkingDir"):
+        rec["launcher"].append(str(vals["WorkingDir"]))
+
+    # ② 卸载信息：InstallLocation 经常是空的，DisplayIcon 才是 loader 的绝对路径
+    for hive, hlabel in ((winreg.HKEY_LOCAL_MACHINE, "HKLM"), (winreg.HKEY_CURRENT_USER, "HKCU")):
+        for view, vlabel in ((winreg.KEY_WOW64_64KEY, ""), (winreg.KEY_WOW64_32KEY, " (32位视图)")):
+            base = _values(hive, UNINSTALL_SUB, view)
+            for sub in base.get("__subkeys__", []):
+                low = sub.lower()
+                if GAME_ID_HINT.lower() not in low and "stove" not in low:
+                    continue
+                vals = _values(hive, UNINSTALL_SUB + "\\" + sub, view)
+                if not vals:
+                    continue
+                rec["uninstall"].append((hlabel + vlabel + "\\" + sub, vals))
+                for key in ("UninstallString", "ModifyPath"):
+                    exe = str(vals.get(key, "")).strip().strip('"')
+                    if exe.lower().endswith(".exe"):
+                        rec["launcher"].append(exe)
+    if not rec["uninstall"]:
+        trace.append("注册表: 卸载项里没有 STOVE/本作记录")
+    return rec
+
+
+def registry_candidates(rec, trace):
+    """注册表能直接确认的游戏根目录（权威来源）。"""
+    out = []
+    for game_id, raw, exe_name in rec["apps"]:
+        root, _notes = normalize_game_path(raw)
+        if has_anchor(root):
+            trace.append("注册表 SGUP\\apps\\%s → %s" % (game_id, root))
+            out.append((root, "注册表GamePath(%s)" % game_id))
+        else:
+            trace.append("注册表 %s 的 GamePath=%s 下没有 %s" % (game_id, root or "(空)", GAME_ANCHOR_REL))
+    for sub, vals in rec["uninstall"]:
+        raw = str(vals.get("InstallLocation") or "").strip()
+        if not raw:
+            raw = str(vals.get("DisplayIcon", "")).rsplit(",", 1)[0].strip().strip('"')
+        root, _notes = normalize_game_path(raw)
+        if has_anchor(root):
+            trace.append("注册表 卸载项 %s → %s" % (sub, root))
+            out.append((root, "注册表卸载信息"))
+    return out
+
+
+def stove_manifest_info():
+    """%LOCALAPPDATA%\\STOVE\\GameManifest\\<id>_<版本>.json：官方安装清单。
+    给不出绝对路径，但给出默认目录名（可能与实机不同）、相对 exe 对与客户端已知版本号 ——
+    版本号是判断「这份副本旧不旧」的尺子。"""
+    base = os.path.join(os.environ.get("LOCALAPPDATA", ""), *STOVE_MANIFEST_SUB.split(os.sep))
+    best = None
+    for path in glob.glob(os.path.join(base, "*.json")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        version = _as_int(data.get("version_no")) or 0
+        if best is None or version >= best[0]:
+            best = (version, data)
+    if not best:
+        return {}
+    version, data = best
+    return {"version_no": version,
+            "root_folder": str(data.get("root_folder") or ""),
+            "launcher_dir": base}
+
+
+def _as_int(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def candidate_version(root):
+    """<root>\\combinedata_manifest\\GameManifest_*.upf 里的 local_version（是 JSON）。
+    只有被官方启动器装过的目录才有；手抄副本常没这目录、或版本停在拷贝那一刻 ——
+    这就是区分真身与诱饵的判据。"""
+    best = None
+    for path in glob.glob(os.path.join(root or "", "combinedata_manifest", "*.upf")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        version = _as_int(data.get("local_version")) if isinstance(data, dict) else None
+        if version is not None and (best is None or version > best):
+            best = version
+    return best
+
+
+def derived_game_roots(rec, trace):
+    """STOVE 客户端自身位置往上找「游戏的邻居目录」，比盲扫整块盘精准得多。"""
+    out = []
+    for seed in rec.get("launcher", []):
+        parent = os.path.dirname(normalize_game_path(seed)[0])
+        for _level in range(4):
+            if not parent:
+                break
+            for leaf in ("Games", os.path.join("SteamLibrary", "steamapps", "common"), "xboxgames"):
+                cand = os.path.join(parent, leaf)
+                if os.path.isdir(cand) and cand.lower() not in {x.lower() for x in out}:
+                    out.append(cand)
+            parent = os.path.dirname(parent)
+    if out:
+        trace.append("STOVE 派生的游戏目录候选: %s" % "; ".join(out))
+    return out
+
+
+def tool_side_candidates(names):
+    """工具自己在哪，游戏大概率就在哪 —— README 明写「解压到游戏目录的同级」。"""
+    out = []
+    base = os.path.normpath(EXE_DIR)
+    for _level in range(4):
+        for name in names:
+            for leaf in (name, os.path.join("Games", name)):
+                cand = os.path.join(base, leaf)
+                if has_anchor(cand):
+                    out.append((normalize_game_path(cand)[0], "工具同级"))
+        parent = os.path.dirname(base)
+        if parent == base:
+            break
+        base = parent
+    return out
+
+
+def bfs_find(names, roots, levels=BFS_MAX_LEVELS, cancel=None, on_progress=None,
+             source="有界探测"):
+    """逐层广度优先找 `<候选名>\\bin\\<exe>`，返回 [(游戏根目录, 来源)]。
+    按层收敛是 os.walk 给不了的：浅层先出（越浅越像正式安装）、同层跳过 junction
+    免扫两遍、每层查一次取消就够及时。"""
+    lowered = {str(n).lower() for n in names if n}
+    hits = []
+    frontier = [os.path.normpath(r) for r in roots]
+    visited = {os.path.normcase(x) for x in frontier}
+    for level in range(levels):
+        nxt = []
+        for folder in frontier:
+            try:
+                with os.scandir(folder) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for entry in entries:
+                if cancel is not None and cancel.is_set():
+                    return hits, True
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                name = entry.name.lower()
+                if name in lowered and has_anchor(entry.path):
+                    hits.append((entry.path, source))
+                    continue
+                if name.startswith(BFS_PRUNE_PREFIX) or is_reparse_point(entry.path):
+                    continue
+                key = os.path.normcase(entry.path)
+                if key in visited:
+                    continue
+                visited.add(key)
+                nxt.append(entry.path)
+        if on_progress:
+            on_progress(level + 1, len(nxt))
+        frontier = nxt
+        if not frontier:
+            break
+    return hits, False
+
+
+def score_candidate(root, expected_version=None):
+    """多副本时的排序键（升序，越前越可信）。"""
+    local_version = candidate_version(root) or 0
+    exe = os.path.join(root, GAME_ANCHOR_REL)
+    try:
+        mtime = int(os.stat(exe).st_mtime)
+    except OSError:
+        mtime = 0
+    pack_dir = os.path.join(root, *COMBINED_MANIFEST_SUB.split(os.sep))
+    try:
+        volumes = len([f for f in os.listdir(pack_dir) if f.startswith("data.pack")])
+    except OSError:
+        volumes = 0
+    lowered = os.path.normpath(root).lower().replace("/", "\\")
+    penalties = sum(1 for token in COPY_HINT_TOKENS if token in lowered)
+    return (0 if local_version else 1,        # 有官方就地清单者优先
+            -local_version,                   # 版本新者优先
+            -volumes,                         # 数据分卷多者优先
+            -mtime,                           # exe 修改时间新者优先
+            lowered.rstrip("\\").count("\\"),  # 路径浅者优先
+            penalties)                        # 像手工拷贝的降权
+
+
+def dedupe(pool):
+    """按 normcase 去重（Games 与 games 会被当成两个候选；同一根也可能多路命中）。"""
+    out = {}
+    for root, source in pool:
+        key = os.path.normcase(os.path.normpath(root))
+        if key not in out:
+            out[key] = (root, source)
+    return list(out.values())
+
+
+def locate_game_bin(levels=BFS_MAX_LEVELS, cancel=None, report=None, chosen=None,
+                    on_progress=None):
+    """定位游戏 bin 目录，返回 (bin 路径 或 "", 来源, 轨迹)。
+    levels=2 只问不扫盘（启动期静默恢复用），5=「自动寻找」，8=勾了深度搜索。"""
+    def say(msg, level="info"):
+        if report:
+            report(msg, level)
+
+    trace = []
+    started = time.perf_counter()
+    rec = read_registry_records(trace)
+    names = list(GAME_ROOT_NAMES)
+    for _gid, raw, _exe in rec["apps"]:
+        _add_name(names, os.path.basename(normalize_game_path(raw)[0]))
+    manifest = stove_manifest_info()
+    _add_name(names, manifest.get("root_folder"))
+    expected = manifest.get("version_no")
+
+    def finish(root, source):
+        bin_path = os.path.join(root, "bin")
+        elapsed = (time.perf_counter() - started) * 1000
+        trace.append("耗时 %.1f ms → %s（%s）" % (elapsed, bin_path, source))
+        if expected:
+            local = candidate_version(root)
+            if local and local < expected:
+                trace.append("⚠ 该副本版本 %s，STOVE 客户端已知 %s —— 可能不是当前在玩的那份"
+                             % (local, expected))
+        return bin_path, source, trace
+
+    # ① 工具自身位置：用户把它放在哪就是给哪打补丁（下面已按锚点筛过）
+    tool_pool = dedupe(tool_side_candidates(names))
+    if tool_pool:
+        root, source = tool_pool[0]
+        say("已按工具所在目录就近命中；若要改用启动器记录的那份，请手动「浏览」选择", "info")
+        return finish(root, source)
+
+    # ② 注册表（官方写下的路径）——命中即终局，不参与打分
+    reg = registry_candidates(rec, trace)
+    if reg:
+        best = sorted(dedupe(reg), key=lambda x: score_candidate(x[0], expected))[0]
+        return finish(best[0], best[1])
+
+    # ③ 逐层有界扫盘：收齐全部候选再打分，避免「第一个恰好是旧副本」
+    roots = list_drives() + derived_game_roots(rec, trace)
+    found, _cancelled = bfs_find(names, roots, levels=levels, cancel=cancel,
+                                 on_progress=on_progress,
+                                 source="深度探测" if levels > BFS_MAX_LEVELS else "有界探测")
+    pool = dedupe(found)
+    if cancel is not None and cancel.is_set():
+        trace.append("搜索已按用户要求中止")
+        return "", "", trace
+    if not pool:
+        trace.append("所有途径都没能确认 %s" % GAME_ANCHOR_REL)
+        return "", "", trace
+    if len(pool) > 1:
+        ranked = sorted(pool, key=lambda x: score_candidate(x[0], expected))
+        trace.append("发现 %d 份完整副本: %s" % (len(ranked), "; ".join(r[0] for r in ranked)))
+        if chosen:
+            picked = chosen(ranked)
+            if not picked:
+                trace.append("用户在候选列表里取消了选择")
+                return "", "", trace
+            pool = [picked]
+        else:
+            pool = ranked
+    return finish(*pool[0])
+
+
+def settings_paths():
+    """配置落点候选：与内嵌 JS 的 _pickWritableToolkitDir 同一条思路，
+    工具自身目录优先，不可写再退到用户级目录。"""
+    out = [EXE_DIR,
+           os.path.join(os.environ.get("LOCALAPPDATA", ""), "ChaosZero-Toolkit"),
+           os.path.join(os.environ.get("TEMP", "."), "ChaosZero-Toolkit")]
+    return [p for p in out if p]
+
+
+def load_settings():
+    """读回上次的路径记忆。返回 (dict, 文件路径)。文件坏了就当没有。"""
+    for folder in settings_paths():
+        path = os.path.join(folder, SETTINGS_NAME)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data, path
+    return {}, ""
+
+
+def save_settings(payload):
+    """单键小文件，逐个候选目录试「写 + 回读校验」；全失败只退化为会话记忆。"""
+    for folder in settings_paths():
+        path = os.path.join(folder, SETTINGS_NAME)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+            with open(path, encoding="utf-8") as stream:
+                json.load(stream)
+            return path
+        except (OSError, ValueError):
+            continue
+    return ""
 
 
 class ChaosZeroToolkit(ctk.CTk):
@@ -93,8 +563,12 @@ class ChaosZeroToolkit(ctk.CTk):
         self.volumes_found = []
         self.has_zht = False
         self.is_running = False
+        self._locate_cancel = threading.Event()
+        self._locating = False
+        self._path_applied = ""
 
         self._build_ui()
+        self._restore_or_autolocate()
 
     # ═══════════════════════════════════════════════════════════════
     # UI 构建
@@ -188,7 +662,7 @@ class ChaosZeroToolkit(ctk.CTk):
 
         hint = ctk.CTkLabel(
             frame,
-            text="选择 ChaosZeroNightmare 文件夹，或点击「自动寻找」让工具扫描全盘",
+            text="选择 ChaosZeroNightmare 文件夹（或直接输入路径后回车）；「自动寻找」先查官方安装记录与常见安装层，必要时才扫盘",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
             text_color=COLOR_TEXT_DIM,
             anchor="w"
@@ -210,7 +684,9 @@ class ChaosZeroToolkit(ctk.CTk):
             border_width=1,
             border_color=COLOR_BORDER
         )
-        self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        # 手打路径也要生效：回车/失焦即校验并检测
+        for seq in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+            self.path_entry.bind(seq, self._on_path_typed)
 
         self.auto_find_btn = ctk.CTkButton(
             row,
@@ -239,6 +715,28 @@ class ChaosZeroToolkit(ctk.CTk):
             command=self._browse_game_dir
         )
         browse_btn.pack(side="right")
+
+        self.deep_scan_var = ctk.BooleanVar(value=False)
+        self.deep_scan_cb = ctk.CTkCheckBox(
+            row,
+            text="深度搜索",
+            variable=self.deep_scan_var,
+            width=100,
+            height=36,
+            checkbox_width=16,
+            checkbox_height=16,
+            corner_radius=4,
+            fg_color=COLOR_BG_CARD,
+            border_color=COLOR_BORDER,
+            border_width=1,
+            text_color=COLOR_TEXT_DIM,
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
+            command=self._toggle_deep_tip
+        )
+        self.deep_scan_cb.pack(side="right", padx=(0, 6))
+        # expand 的输入框必须最后 pack，否则窗口一窄就把右侧按钮挤出容器点不到
+        self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._deep_tip_shown = False
 
     def _build_status_section(self, parent):
         frame = ctk.CTkFrame(parent, fg_color=COLOR_BG_CARD, corner_radius=10,
@@ -504,72 +1002,146 @@ class ChaosZeroToolkit(ctk.CTk):
     # 自动寻找游戏目录
     # ═══════════════════════════════════════════════════════════════
     def _auto_find_game(self):
-        """扫描所有磁盘，查找 ChaosZeroNightmare 文件夹。"""
-        self._log_line("开始自动寻找游戏目录...", "step")
-        self.auto_find_btn.configure(state="disabled", text="🔍 搜索中...")
+        """按「权威来源 → 有界探测 → 剪枝扫盘」的顺序定位游戏目录；搜索中再点一次即停止。"""
+        if self._locating:
+            self._locate_cancel.set()
+            self._log_line("正在停止搜索（当前层结束后返回）...", "warn")
+            return
+        deep = bool(self.deep_scan_var.get())
+        self._locate_cancel.clear()
+        self._locating = True
+        self.auto_find_btn.configure(text="⏹ 停止搜索", fg_color=COLOR_HIGHLIGHT,
+                                     hover_color="#B91C1C")
+        self._log_line("开始自动寻找游戏目录（%s）..." % ("深度搜索" if deep else "常规探测"), "step")
+        threading.Thread(target=self._auto_find_worker,
+                         args=(BFS_DEEP_LEVELS if deep else BFS_MAX_LEVELS,), daemon=True).start()
 
-        thread = threading.Thread(target=self._auto_find_worker, daemon=True)
-        thread.start()
+    def _reset_auto_find_btn(self):
+        self._locating = False
+        self.auto_find_btn.configure(state="normal", text="🔍 自动寻找",
+                                     fg_color=COLOR_SUCCESS, hover_color="#059669")
 
-    def _auto_find_worker(self):
-        """后台线程：扫描所有磁盘寻找游戏文件夹，找到后立即停止。"""
-        found = None
+    def _toggle_deep_tip(self):
+        """第一次勾深度搜索时说明代价，避免用户以为勾上就更准。"""
+        if self.deep_scan_var.get() and not self._deep_tip_shown:
+            self._deep_tip_shown = True
+            self._log_line("深度搜索会扫到第 %d 层（更慢，只在常规探测落空时才需要）；"
+                           "多数情况下「官方安装记录 + 常见安装层」就已经是对的" % BFS_DEEP_LEVELS, "info")
+
+    def _auto_find_worker(self, levels):
+        """后台线程：只定位与打日志，一切界面改动回主线程执行。"""
+        found, source, trace = "", "", []
+        shown_layer = [0]
+
+        def on_progress(level, pending):
+            if level != shown_layer[0]:
+                shown_layer[0] = level
+                self._log_line(f"  已扫完第 {level} 层，下一层待查 {pending} 个目录", "info")
+
         try:
-            # 获取所有磁盘盘符
-            drives = []
-            for letter in string.ascii_uppercase:
-                drive = f"{letter}:\\"
-                if os.path.exists(drive):
-                    drives.append(drive)
-
-            self._log_line(f"扫描 {len(drives)} 个磁盘: {', '.join(drives)}", "info")
-
-            for drive in drives:
-                if found:
-                    break
-                self._log_line(f"  扫描 {drive} ...", "info")
-                try:
-                    for root, dirs, files in os.walk(drive):
-                        # 限制搜索深度（最多5层）避免时间过长
-                        depth = root.replace(drive, '').count(os.sep)
-                        if depth > 4:
-                            dirs.clear()
-                            continue
-                        # 跳过系统/隐藏目录
-                        dirs[:] = [d for d in dirs if not d.startswith('.')
-                                   and d not in ('Windows', '$Recycle.Bin', 'System Volume Information',
-                                                 'ProgramData', 'Recovery', 'node_modules', '.git')]
-                        if GAME_FOLDER_NAME in dirs:
-                            game_path = os.path.join(root, GAME_FOLDER_NAME)
-                            bin_path = os.path.join(game_path, "bin")
-                            if os.path.isdir(bin_path):
-                                exe_path = os.path.join(bin_path, GAME_EXE_NAME)
-                                if os.path.isfile(exe_path):
-                                    found = bin_path
-                                    self._log_line(f"  ✅ 找到: {bin_path}", "ok")
-                                    break  # 立即停止扫描
-                except PermissionError:
-                    continue
-
-            if found:
-                self._log_line(f"自动定位成功: {found}", "ok")
-                self.after(0, lambda: self._apply_found_path(found))
-            else:
-                self._log_line("未在任何磁盘中找到 ChaosZeroNightmare 游戏目录", "error")
-                self.after(0, lambda: messagebox.showwarning(
-                    "未找到游戏",
-                    f"未在任何磁盘中找到 {GAME_FOLDER_NAME} 文件夹。\n\n"
-                    "请使用「浏览」按钮手动选择游戏的 bin 目录。"
-                ))
+            found, source, trace = locate_game_bin(
+                levels=levels, cancel=self._locate_cancel,
+                report=lambda msg, level="info": self._log_line(msg, level),
+                on_progress=on_progress,
+                chosen=self._choose_candidate)
         except Exception as e:
             self._log_line(f"自动寻找出错: {e}", "error")
+            for line in traceback.format_exc().splitlines():
+                self._log_line("    " + line, "error")
         finally:
-            self.after(0, lambda: self.auto_find_btn.configure(state="normal", text="🔍 自动寻找"))
+            self.after(0, self._reset_auto_find_btn)
 
-    def _apply_found_path(self, bin_path):
-        """应用找到的游戏路径。"""
+        for line in trace:
+            self._log_line("  · " + line, "warn" if line.startswith("⚠") else "info")
+        if found:
+            self._log_line(f"自动定位成功: {found}", "ok")
+            self.after(0, lambda: self._apply_found_path(found, source))
+            return
+        if self._locate_cancel.is_set():
+            self._log_line("搜索已停止", "warn")
+            return
+        self._log_line("未能定位游戏目录，请用「浏览」手动选择", "error")
+        self.after(0, lambda: messagebox.showwarning(
+            "未找到游戏",
+            f"查过官方安装记录、STOVE 清单与 {levels} 层磁盘扫描，都没能确认这个文件：\n\n"
+            f"  {GAME_FOLDER_NAME}\\{GAME_ANCHOR_REL}\n\n"
+            "请确认游戏已安装完整，或用「浏览」手动选择（选包含 bin 的那一层）。\n"
+            "也可以勾选「深度搜索」后重试。"))
+
+    def _choose_candidate(self, ranked):
+        """多份可信度相同的副本时让用户点名。在后台线程里被调用，回主线程弹窗并等结果。"""
+        result = {"pick": None}
+        done = threading.Event()
+        self.after(0, lambda: self._ask_candidate(ranked, result, done))
+        if not done.wait(300):
+            return ranked[0]          # 用户没理会就别卡住搜索
+        return result["pick"]
+
+    def _ask_candidate(self, ranked, result, done):
+        box = ctk.CTkToplevel(self)
+        box.title("选择要处理的游戏目录")
+        box.geometry("640x320")
+        box.transient(self)
+        chosen = ctk.StringVar(value=ranked[0][0])
+        ctk.CTkLabel(
+            box, text="发现多份都完整的游戏目录，请选择要汉化/加速的那一份：",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13), text_color=COLOR_TEXT
+        ).pack(padx=16, pady=(14, 6), anchor="w")
+        for root, source in ranked[:8]:
+            version = candidate_version(root)
+            ctk.CTkRadioButton(
+                box, text="%s   （%s，就地版本 %s）" % (root, source, version if version else "无清单"),
+                variable=chosen, value=root,
+                font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12), text_color=COLOR_TEXT_DIM
+            ).pack(padx=20, pady=3, anchor="w")
+
+        def settle(value):
+            result["pick"] = value
+            done.set()
+            box.destroy()
+
+        box.protocol("WM_DELETE_WINDOW", lambda: settle(None))
+
+        ctk.CTkLabel(
+            box, text="判据：就地清单版本号 > 分卷数 > exe 修改时间 > 路径深度；默认已选中最可信的一份",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=11), text_color=COLOR_TEXT_DIM
+        ).pack(padx=16, pady=(10, 4), anchor="w")
+        row = ctk.CTkFrame(box, fg_color="transparent")
+        row.pack(pady=10)
+        ctk.CTkButton(row, text="就用这个", width=110, command=lambda: settle(chosen.get())).pack(side="left", padx=6)
+        ctk.CTkButton(row, text="取消", width=90, fg_color="#313244",
+                      command=lambda: settle(None)).pack(side="left", padx=6)
+        box.grab_set()
+        box.after(120, box.lift)
+
+    def _apply_found_path(self, bin_path, source=""):
+        """应用游戏 bin 目录并记住它 —— 下次启动直接恢复，不必再探测。"""
         self.game_bin_path.set(bin_path)
+        self._path_applied = str(bin_path).strip()
+        save_settings({"game_bin_path": bin_path,
+                       "source": source or "手动",
+                       "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
         self._detect_game_files(bin_path)
+
+    def _restore_or_autolocate(self):
+        """启动流程：路径记忆仍有效就零扫描恢复；否则只跑毫秒级的权威层。"""
+        saved, settings_file = load_settings()
+        bin_path = normalize_game_path(saved.get("game_bin_path", ""))[0]
+        if bin_path and has_bin_exe(bin_path):
+            self._log_line("已恢复上次使用的游戏目录（来源：%s，配置在 %s）"
+                           % (saved.get("source", "记忆"), os.path.dirname(settings_file)), "info")
+            self.game_bin_path.set(bin_path)
+            self._path_applied = bin_path
+            self._detect_game_files(bin_path)
+            return
+        if bin_path:
+            self._log_line("上次的游戏目录已不可用，重新定位: %s" % bin_path, "warn")
+        found, source, trace = locate_game_bin(levels=2)
+        if found and has_bin_exe(found):
+            self._log_line("已自动定位游戏目录: %s（%s）" % (found, source), "ok")
+            self._apply_found_path(found, source)
+            return
+        self._log_line("未找到游戏目录 —— 点「自动寻找」做完整探测，或直接输入路径/用「浏览」选择", "warn")
 
     # ═══════════════════════════════════════════════════════════════
     # 路径选择 & 检测
@@ -580,24 +1152,38 @@ class ChaosZeroToolkit(ctk.CTk):
             initialdir=self.game_bin_path.get() or os.path.expanduser("~")
         )
         if path:
-            path = self._resolve_game_path(path)
-            self.game_bin_path.set(path)
-            self._detect_game_files(path)
+            bin_path, notes = self._resolve_game_path(path)
+            for note in notes:
+                self._log_line("路径已修正: %s" % note, "info")
+            self._apply_found_path(bin_path, "手动浏览")
+
+    def _on_path_typed(self, _event=None):
+        """手打路径也要认：回车或失焦即归一化 + 校验 + 检测。"""
+        raw = self.game_bin_path.get().strip()
+        if not raw or os.path.normcase(raw) == os.path.normcase(self._path_applied):
+            return
+        bin_path, notes = self._resolve_game_path(raw)
+        if not has_bin_exe(bin_path):
+            self._log_line("该路径下没有 %s，暂不启用构建: %s"
+                           % (GAME_ANCHOR_REL, "; ".join(notes) or raw), "warn")
+            return
+        if os.path.normcase(bin_path) != os.path.normcase(raw):
+            self._log_line("路径已修正: %s → %s" % (raw, bin_path), "info")
+        self._apply_found_path(bin_path, "手动输入")
 
     def _resolve_game_path(self, path):
-        """
-智能路径解析：
-- 如果选的是 ChaosZeroNightmare 根目录，自动进入 bin 子目录
-- 如果选的是 bin 目录，直接使用
-"""
-        basename = os.path.basename(path)
-        # 用户选了根目录 ChaosZeroNightmare
-        if basename == GAME_FOLDER_NAME:
-            bin_sub = os.path.join(path, "bin")
-            if os.path.isdir(bin_sub):
-                self._log_line(f"自动定位到 bin 子目录: {bin_sub}", "info")
-                return bin_sub
-        return path
+        """任意写法（根目录 / bin / exe / 斜杠 / 引号 / %VAR%）收敛成 bin 目录。
+        判据始终是 bin\\<exe> 在不在，所以目录被改名或挪盘也不会认错副本。"""
+        root, notes = normalize_game_path(path)
+        if not root:
+            return "", ["路径为空"]
+        if has_anchor(root):
+            if os.path.basename(os.path.normpath(path)).lower() != "bin":
+                notes.append("已定位到 bin 子目录")
+            return os.path.join(root, "bin"), notes
+        if has_bin_exe(root):
+            return root, notes
+        return os.path.join(root, "bin"), notes + ["该目录下没有 %s" % GAME_ANCHOR_REL]
 
     def _get_embedded_js_dir(self):
         """返回随工具发布的完整内嵌 JavaScript 资源目录。"""
@@ -1099,5 +1685,16 @@ class ChaosZeroToolkit(ctk.CTk):
 # 入口
 # ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    if "--locate-selftest" in sys.argv:
+        # 无头自测：打印定位结果与逐层轨迹，作为路径定位的回归基线
+        levels = BFS_DEEP_LEVELS if "--deep" in sys.argv else BFS_MAX_LEVELS
+        t0 = time.perf_counter()
+        hit, from_where, trail = locate_game_bin(levels=levels)
+        for item in trail:
+            print("  · %s" % item)
+        print("结果: %s" % (hit or "(未找到)"))
+        print("来源: %s" % (from_where or "-"))
+        print("总耗时: %.1f ms" % ((time.perf_counter() - t0) * 1000))
+        sys.exit(0 if hit else 1)
     app = ChaosZeroToolkit()
     app.mainloop()
