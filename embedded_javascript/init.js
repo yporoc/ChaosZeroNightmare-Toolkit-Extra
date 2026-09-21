@@ -390,6 +390,7 @@ globalThis.__app = {
         _cfgDefaultSpeedIdx: 1,
         _cfgLastSpeed: 0,
         _cfgLastSkip: false,
+        _cfgPressMaxMs: 500,   // 按住超过这么多毫秒就把倍速还给玩家（真长按不该一直被压着）
         _cfgConfigPath: '',
         _btnPosX: 60,
         _btnPosY: 100,
@@ -428,6 +429,9 @@ globalThis.__app = {
                     '# 上次倍速状态（自动写入，重启游戏自动恢复；0=不记忆）',
                     'last_speed=0',
                     '# 上次动画跳过状态（自动写入，重启游戏自动恢复；0=关 1=开）',
+                    '# 按下期瞬时 1x：修复高倍速下轻点被当成长按，始终启用，这里只调窗口长度',
+                    '# 按住超过这么多毫秒就把倍速还给玩家，默认 500',
+                    'press_max_ms=500',
                     'last_skip=0',
                     'btn_x=60',
                     'btn_y=100',
@@ -477,6 +481,7 @@ globalThis.__app = {
                     else if (key === 'last_skip') {
                         this._cfgLastSkip = (val === '1' || val.toLowerCase() === 'true');
                     }
+                    else if (key === 'press_max_ms') { var n = parseInt(val, 10); if (!isNaN(n) && n > 0) this._cfgPressMaxMs = n; }
                     else if (key === 'btn_x') { var n = parseInt(val, 10); if (!isNaN(n)) globalThis._btnPosX = n; }
                     else if (key === 'btn_y') { var n = parseInt(val, 10); if (!isNaN(n)) globalThis._btnPosY = n; }
                 }
@@ -2899,6 +2904,227 @@ function _installProbeHooks() {
 // --- End of 10_probe_hooks.js ---
 
 
+// --- Start of 11_press_scope.js ---
+// --- [MODULE START] 11_press_scope.js ---
+// 按下期间把全局时钟瞬时降到 1x、松手立即还原 —— 修「高倍速下轻点被当成长按」。
+//
+// 长按判定累加的是被 Scheduler 缩放过的 dt：10x 下 60ms 的一击会累出 600ms，越过阈值。
+// 全项目的倍速机制读的都是同一个状态 _SPEED_LEVELS[_speedIdx]，所以按住这段时间把状态
+// 整体压回 1x，它们各自就都做对了，不必改动其中任何一行。三条纪律：
+//   1) 不经过 _setSpeedAndGuard（全项目唯一写盘点），按住期间不污染 last_speed；
+//   2) 按住期间玩家自己改过倍速、或有保护机制在压低时钟 → 都不去顶；
+//   3) 还原要落在松手那一刻：抬起事件常常收不到，所以多路并行 + 静默判定兜底。
+// 两处坑位：
+//   · _SPEED_LEVELS[0] 是滑条复用的「自定义倍速槽」（见 _handleInputEnded 与持久化恢复），
+//     所以 _speedIdx=0 并不代表 1x —— 降速要连槽位一起改，还原时一起归还。
+//   · 主管道与 0 号调度器之外还有别的调度器在跑卡牌 UI 的回调，漏掉它们累加器仍按 10x 走，
+//     所以施速之后还要逐个钉 0~4 号调度器（与灵光保护 createRSparkSelectPopup 同样的做法）。
+(function () {
+    var SILENT_MS = 120;      // 按下后静默这么久 = 判定已松手（不等抬起事件）
+    var POLL_SEC = 0.05;      // 轮询动作的时钟间隔（1x 约 20Hz，倍速越高越密）
+    var SCHED_COUNT = 5;      // 逐个覆盖 0~4 号调度器
+
+    var st = {
+        armed: false, depth: 0, t0: 0, lastEvt: 0, btn: -1, userAct: 0,
+        idx: 0, l0: 1, lvl: 1, pollNode: null, globalOn: false,
+        installed: false, wrapped: 0
+    };
+
+    function speed() { try { return globalThis._SPEED_LEVELS[globalThis._speedIdx]; } catch (e) { return 1; } }
+    function say(m) { if (typeof globalThis._speedLog === 'function') globalThis._speedLog('[PRESS] ' + m); }
+    function label() { try { if (typeof globalThis._updateSpeedLabel === 'function') globalThis._updateSpeedLabel(); } catch (e) { } }
+    function maxMs() {
+        try {
+            var c = globalThis.__app && __app.getService && __app.getService('ConfigService');
+            return (c && c._cfgPressMaxMs) || 500;
+        } catch (e) { return 500; }
+    }
+    // 保护期间（灵光选择弹窗等）由它自己压低并恢复时钟，我们只还原状态、不顶倍速
+    function guarded() { return !!(globalThis._sparkGuardActive || globalThis._rsparkSelectActive); }
+
+    // 施速之后把 0~4 号调度器逐个钉到同一个值，避免漏掉卡牌 UI 所在的调度器
+    function pin(v) {
+        if (typeof globalThis._applySpeed === 'function') globalThis._applySpeed(v);
+        try {
+            var dir = cc.Director.getInstance();
+            if (typeof dir.getSchedulerByIndex !== 'function') return;
+            for (var i = 0; i < SCHED_COUNT; i++) {
+                var s = dir.getSchedulerByIndex(i);
+                if (s && typeof s.setTimeScale === 'function') s.setTimeScale(v);
+            }
+        } catch (e) { }
+    }
+
+    function lower(btn) {
+        st.idx = globalThis._speedIdx;
+        st.l0 = globalThis._SPEED_LEVELS[0];
+        st.lvl = speed();
+        globalThis._SPEED_LEVELS[0] = 1;
+        globalThis._speedIdx = 0;
+        st.armed = true;
+        st.t0 = st.lastEvt = Date.now();
+        st.btn = btn;
+        pin(1);
+        label();
+        say('ON → 1x（原 ' + st.lvl + 'x）');
+    }
+
+    function restore(why) {
+        if (!st.armed) return;
+        st.armed = false;
+        var dur = (Date.now() - st.t0) + 'ms，' + why;
+        // 玩家改过倍速（F9/F10/滑条/回主界面都走 _setSpeedAndGuard）→ 以他为准
+        if (st.userAct >= st.t0 || globalThis._speedIdx !== 0 || globalThis._SPEED_LEVELS[0] !== 1) {
+            if (globalThis._speedIdx !== 0 && globalThis._SPEED_LEVELS[0] === 1) {
+                globalThis._SPEED_LEVELS[0] = st.l0;      // 换档后没人要这个槽，归还原值
+            }
+            say('OFF → 不覆盖（期间你改过倍速，现在 ' + speed() + 'x，按住 ' + dur + '）');
+            return;
+        }
+        globalThis._SPEED_LEVELS[0] = st.l0;
+        globalThis._speedIdx = st.idx;
+        label();
+        if (guarded()) say('OFF → 交回保护（按住 ' + dur + '）');
+        else { pin(st.lvl); say('OFF → 恢复 ' + st.lvl + 'x（按住 ' + dur + '）'); }
+    }
+
+    // 全局通道：只负责「武装」和「判定松手」，不参与 depth 计数，避免一次点击被算两次
+    function actDown(btn) {
+        st.lastEvt = Date.now();
+        if (!st.armed && speed() > 1) lower(btn);
+    }
+    function actUp(btn, why) {
+        st.lastEvt = Date.now();
+        if (!st.armed) return;
+        if (btn >= 0 && st.btn >= 0 && btn !== st.btn) return;   // 按住右键时动了左键，不算松手
+        st.depth = 0;
+        restore(why);
+    }
+
+    // 控件层：引用计数处理多指重叠，其余通道只负责武装与判定松手
+    function onState(state) {
+        var now = Date.now();
+        st.lastEvt = now;
+        if (state === 0) {                                  // began
+            drivers();
+            if (st.depth > 0 && now - st.t0 > maxMs() * 4) {
+                restore('自愈：上次抬起没收到');
+                st.depth = 0;                               // 不清零就再也进不来
+            }
+            if (st.depth === 0 && speed() > 1) lower(-1);
+            st.depth++;
+        } else if (state === 2 || state === 3) {            // ended / cancelled
+            st.depth = Math.max(0, st.depth - 1);
+            if (st.depth === 0) restore(state === 3 ? 'cancel' : 'up');
+        } else if (state === 1 && st.depth > 0 && now - st.t0 > maxMs()) {
+            st.depth = 1;                                    // 一直动着还在按：把倍速还给玩家
+            restore('超 ' + maxMs() + 'ms 窗口');
+        }
+    }
+
+    function poll() {
+        if (!st.armed) return;
+        var now = Date.now();
+        if (now - st.lastEvt > SILENT_MS) { st.depth = 0; restore('静默判定松手'); }
+    }
+
+    // 轮询驱动与抬起探测：给速度按钮挂 RepeatForever(Sequence(DelayTime, CallFunc))，
+    // 再注册鼠标/触摸两个全局监听。触摸监听必须 onTouchBegan 返回 true 才收得到 Ended；
+    // 且要排在最后 + 不吞事件，才不影响游戏自己的分发。
+    function drivers() {
+        if (!st.pollNode) {
+            var btn = globalThis._speedBtn;
+            try {
+                if (btn && btn.runAction && cc.DelayTime && cc.CallFunc && cc.Sequence && cc.RepeatForever) {
+                    btn.runAction(cc.RepeatForever.create(cc.Sequence.create(
+                        cc.DelayTime.create(POLL_SEC),
+                        cc.CallFunc.create(function () { try { poll(); } catch (e) { } }))));
+                    st.pollNode = btn;                        // 场景切换会重建按钮，引用变了就重挂
+                }
+            } catch (e) { }
+        }
+        if (st.globalOn) return;
+        var disp = null;
+        try { disp = cc.Director.getInstance().getEventDispatcher(); } catch (e) { return; }
+        if (!disp || typeof disp.addEventListenerWithFixedPriority !== 'function') return;
+        var code = function (ev) {                            // 左右键编码各家引擎写法不同
+            try {
+                if (ev && typeof ev.getEventCode === 'function') return Number(ev.getEventCode());
+                if (ev && typeof ev.getMouseButton === 'function') return Number(ev.getMouseButton());
+                if (ev && ev.button !== undefined) return Number(ev.button);
+            } catch (e) { }
+            return -1;
+        };
+        var got = [];
+        try {
+            if (cc.EventListenerMouse && cc.EventListenerMouse.create) {
+                var ml = cc.EventListenerMouse.create();
+                ml.onMouseDown = function (ev) { actDown(code(ev)); };
+                ml.onMouseUp = function (ev) { actUp(code(ev), '全局 mouseUp'); };
+                disp.addEventListenerWithFixedPriority(ml, -200);   // 鼠标监听不存在吞事件，可以排最前
+                globalThis._pressScopeMouseListener = ml;
+                got.push('mouse');
+            }
+        } catch (e) { }
+        try {
+            if (cc.EventListenerTouchOneByOne && cc.EventListenerTouchOneByOne.create) {
+                var tl = cc.EventListenerTouchOneByOne.create();
+                try { if (tl.setSwallowTouches) tl.setSwallowTouches(false); } catch (e) { }
+                tl.swallowTouches = false;
+                tl.onTouchBegan = function () { st.lastEvt = Date.now(); return true; };
+                tl.onTouchMoved = function () { st.lastEvt = Date.now(); };
+                tl.onTouchEnded = function () { actUp(-1, '全局 touchEnded'); };
+                tl.onTouchCancelled = function () { actUp(-1, '全局 touchCancelled'); };
+                disp.addEventListenerWithFixedPriority(tl, 1000);   // 排在最后：不可能吞掉游戏的触摸
+                globalThis._pressScopeTouchListener = tl;
+                got.push('touch');
+            }
+        } catch (e) { }
+        st.globalOn = got.length > 0;
+        say('抬起通道：' + (got.join('+') || '仅控件层') + '，静默 ' + SILENT_MS + 'ms 兜底');
+    }
+
+    // 控件层是补充通道：只有它给出 began/moved/ended 的完整配对，多指重叠靠引用计数。
+    // 安装与否用 st.installed 判断，不能用 prototype 上的标记位——长按补丁 L1 也会替换
+    // addTouchEventListener，标记位被它抹掉会导致每帧重装。也不设包裹数量上限：卡池 UI
+    // 每局新建几十个按钮，上限会在几分钟后烧尽，之后新注册的控件全部收不到事件。
+    function install() {
+        if (st.installed || typeof cc === 'undefined' || !ccui || !ccui.Widget || !ccui.Widget.prototype) return;
+        var proto = ccui.Widget.prototype;
+        var orig = proto.addTouchEventListener;
+        if (typeof orig !== 'function') return;
+        st.installed = true;
+        // 注意别写 arguments[0]：非严格模式下会回写同名形参，闭包自引用直接爆栈
+        proto.addTouchEventListener = function (selector, target) {
+            var self = this, fn = selector;
+            if (typeof fn === 'function' && !fn._pressScope) {
+                if (++st.wrapped % 2000 === 0) say('已包裹 ' + st.wrapped + ' 个控件回调');
+                var inner = function (sender, state) {
+                    try { onState(state); } catch (e) { }
+                    return fn.apply(this, arguments);
+                };
+                inner._pressScope = true;
+                return orig.call(self, inner, target);
+            }
+            return orig.call(self, fn, target);
+        };
+        proto.addTouchEventListener._pressScope = true;
+        // 记下玩家动手改倍速的时刻：据此区分「他改的」与「我们改的」
+        var ssg = globalThis._setSpeedAndGuard;
+        if (typeof ssg === 'function' && !ssg._pressScope) {
+            var mark = function (s) { st.userAct = Date.now(); return ssg.apply(this, arguments); };
+            mark._pressScope = true;
+            globalThis._setSpeedAndGuard = mark;
+        }
+        say('已就位（按下期瞬时 1x，窗口 ' + maxMs() + 'ms）');
+        drivers();
+    }
+
+    globalThis._tryInstallPressScope = function () { try { install(); } catch (e) { } };
+})();
+// --- [MODULE END] 11_press_scope.js ---
+// --- End of 11_press_scope.js ---
+
 // --- Start of 90_main.js ---
 // --- [MODULE START] 90_main.js ---
 (function() {
@@ -3012,6 +3238,10 @@ function _director_after_draw() {
     // [LONG PRESS FIX] 检查并挂载长按补丁
     if (typeof globalThis._hookLongPressUpdateProperty === 'function') {
         globalThis._hookLongPressUpdateProperty();
+    }
+    // [按下期瞬时 1x] 挂载（install 自带幂等）
+    if (typeof globalThis._tryInstallPressScope === 'function') {
+        globalThis._tryInstallPressScope();
     }
     // [Chaos透视] 挂载
     if (typeof globalThis._tryAttachChaosHooks === 'function') {
