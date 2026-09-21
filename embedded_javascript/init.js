@@ -391,6 +391,7 @@ globalThis.__app = {
         _cfgLastSpeed: 0,
         _cfgLastSkip: false,
         _cfgPressMaxMs: 500,   // 按住超过这么多毫秒就把倍速还给玩家（真长按不该一直被压着）
+        _cfgKeepAliveSec: 15,  // KeepAlive 维持周期（秒），最小 2
         _cfgConfigPath: '',
         _btnPosX: 60,
         _btnPosY: 100,
@@ -432,6 +433,10 @@ globalThis.__app = {
                     '# 按下期瞬时 1x：修复高倍速下轻点被当成长按，始终启用，这里只调窗口长度',
                     '# 按住超过这么多毫秒就把倍速还给玩家，默认 500',
                     'press_max_ms=500',
+                    '# KeepAlive 维持周期（秒，最小 2）：倍速被游戏改回后最迟多久钉回来',
+                    '# 改小恢复更快，但每次 tick 都会施速并可能补装守卫，开销随之上升',
+                    '# 周期随动作在启动时创建，改这个值要重启游戏才生效',
+                    'keepalive_sec=15',
                     'last_skip=0',
                     'btn_x=60',
                     'btn_y=100',
@@ -482,6 +487,7 @@ globalThis.__app = {
                         this._cfgLastSkip = (val === '1' || val.toLowerCase() === 'true');
                     }
                     else if (key === 'press_max_ms') { var n = parseInt(val, 10); if (!isNaN(n) && n > 0) this._cfgPressMaxMs = n; }
+                    else if (key === 'keepalive_sec') { var n = parseInt(val, 10); if (!isNaN(n) && n >= 2) this._cfgKeepAliveSec = n; }
                     else if (key === 'btn_x') { var n = parseInt(val, 10); if (!isNaN(n)) globalThis._btnPosX = n; }
                     else if (key === 'btn_y') { var n = parseInt(val, 10); if (!isNaN(n)) globalThis._btnPosY = n; }
                 }
@@ -548,9 +554,17 @@ globalThis.__app = {
         _keepAliveCounts: { A: 0 },
         _lastKeepAliveWallTime: 0,
 
+        // 维持周期（秒），来自 speed_config.txt 的 keepalive_sec；下限 2 秒防刷
+        _cycleSec: function() {
+            var cfg = __app.getService('ConfigService');
+            var sec = (cfg && cfg._cfgKeepAliveSec) || 15;
+            return sec < 2 ? 2 : sec;
+        },
+
         _doKeepAliveTick: function(source) {
             var wallNow = Date.now();
-            if (wallNow - this._lastKeepAliveWallTime < 10000) return;
+            // 墙上时钟最小间隔：保持原有 10s/15s 的 2:3 关系，倍速越高动作时钟走得越快
+            if (wallNow - this._lastKeepAliveWallTime < this._cycleSec() * 1000 * 2 / 3) return;
             this._lastKeepAliveWallTime = wallNow;
 
             var src = source || '?';
@@ -613,7 +627,7 @@ globalThis.__app = {
             globalThis._speedLog('[Keep-Alive] Action API probe: ' + apis.join(', '));
 
             try {
-                var delay = cc.DelayTime.create(15);
+                var delay = cc.DelayTime.create(this._cycleSec());
                 var callFunc = null;
                 if (typeof cc.CallFunc !== 'undefined' && typeof cc.CallFunc.create === 'function') {
                     var self = this;
@@ -642,7 +656,7 @@ globalThis.__app = {
 
                 targetNode.runAction(forever);
                 this._keepAliveRunning = true;
-                globalThis._speedLog('[Keep-Alive] SUCCESS: Action running on node. 15s cycle active.');
+                globalThis._speedLog('[Keep-Alive] SUCCESS: Action running on node. ' + this._cycleSec() + 's cycle active.');
             } catch (e) {
                 globalThis._speedLog('[Keep-Alive] Action setup FAILED: ' + e);
             }
