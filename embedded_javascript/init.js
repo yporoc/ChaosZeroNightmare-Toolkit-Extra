@@ -2926,7 +2926,9 @@ function _installProbeHooks() {
 // 全项目的倍速机制读的都是同一个状态 _SPEED_LEVELS[_speedIdx]，所以按住这段时间把状态
 // 整体压回 1x，它们各自就都做对了，不必改动其中任何一行。三条纪律：
 //   1) 不经过 _setSpeedAndGuard（全项目唯一写盘点），按住期间不污染 last_speed；
-//   2) 按住期间玩家自己改过倍速、或有保护机制在压低时钟 → 都不去顶；
+//   2) 按住期间玩家自己改过倍速 → 不覆盖他；保护机制正压低时钟时先交回给它，
+//      但到期校验一次 —— 有些保护路线（栈回溯识别、Map 事件）撤销时不施速，
+//      不校验就得等 KeepAlive 的 15 秒周期；
 //   3) 还原要落在松手那一刻：抬起事件常常收不到，所以多路并行 + 静默判定兜底。
 // 两处坑位：
 //   · _SPEED_LEVELS[0] 是滑条复用的「自定义倍速槽」（见 _handleInputEnded 与持久化恢复），
@@ -2935,16 +2937,23 @@ function _installProbeHooks() {
 //     所以施速之后还要逐个钉 0~4 号调度器（与灵光保护 createRSparkSelectPopup 同样的做法）。
 (function () {
     var SILENT_MS = 120;      // 按下后静默这么久 = 判定已松手（不等抬起事件）
+    var HAND_MS = 4000;       // 交回保护后的补速期限，必须晚于灵光弹窗自己的 3 秒恢复
     var POLL_SEC = 0.05;      // 轮询动作的时钟间隔（1x 约 20Hz，倍速越高越密）
     var SCHED_COUNT = 5;      // 逐个覆盖 0~4 号调度器
 
     var st = {
         armed: false, depth: 0, t0: 0, lastEvt: 0, btn: -1, userAct: 0,
-        idx: 0, l0: 1, lvl: 1, pollNode: null, globalOn: false,
-        installed: false, wrapped: 0
+        idx: 0, l0: 1, lvl: 1, hand: 0, handFrom: 0,
+        pollNode: null, globalOn: false, installed: false, wrapped: 0
     };
 
     function speed() { try { return globalThis._SPEED_LEVELS[globalThis._speedIdx]; } catch (e) { return 1; } }
+    function engineScale() {
+        try {
+            var s = cc.Director.getInstance().getScheduler();
+            return (s && typeof s.getTimeScale === 'function') ? Number(s.getTimeScale()) : -1;
+        } catch (e) { return -1; }
+    }
     function say(m) { if (typeof globalThis._speedLog === 'function') globalThis._speedLog('[PRESS] ' + m); }
     function label() { try { if (typeof globalThis._updateSpeedLabel === 'function') globalThis._updateSpeedLabel(); } catch (e) { } }
     function maxMs() {
@@ -2978,6 +2987,7 @@ function _installProbeHooks() {
         st.armed = true;
         st.t0 = st.lastEvt = Date.now();
         st.btn = btn;
+        st.hand = 0;                       // 新的一次按下重来，别让上一次的保护窗口插一手
         pin(1);
         label();
         say('ON → 1x（原 ' + st.lvl + 'x）');
@@ -2998,8 +3008,11 @@ function _installProbeHooks() {
         globalThis._SPEED_LEVELS[0] = st.l0;
         globalThis._speedIdx = st.idx;
         label();
-        if (guarded()) say('OFF → 交回保护（按住 ' + dur + '）');
-        else { pin(st.lvl); say('OFF → 恢复 ' + st.lvl + 'x（按住 ' + dur + '）'); }
+        if (guarded()) {                                  // 交给压低时钟的一方，但盯到期后校验
+            st.handFrom = Date.now();
+            st.hand = st.handFrom + HAND_MS;
+            say('OFF → 交回保护（按住 ' + dur + '，' + HAND_MS + 'ms 后校验）');
+        } else { pin(st.lvl); say('OFF → 恢复 ' + st.lvl + 'x（按住 ' + dur + '）'); }
     }
 
     // 全局通道：只负责「武装」和「判定松手」，不参与 depth 计数，避免一次点击被算两次
@@ -3037,9 +3050,19 @@ function _installProbeHooks() {
     }
 
     function poll() {
-        if (!st.armed) return;
         var now = Date.now();
-        if (now - st.lastEvt > SILENT_MS) { st.depth = 0; restore('静默判定松手'); }
+        if (st.armed) {
+            if (now - st.lastEvt > SILENT_MS) { st.depth = 0; restore('静默判定松手'); }
+            return;
+        }
+        if (!st.hand || now < st.hand) return;
+        st.hand = 0;                                      // 一次性的，绝不反复与引擎抢帧
+        if (st.userAct >= st.handFrom) return;             // 期间玩家改过倍速，别再插手
+        var want = speed(), es = engineScale();
+        if (want > 1 && es >= 0 && es < want - 0.05) {
+            pin(want);
+            say('交回超时补速：引擎 ' + es + ' → ' + want + 'x');
+        }
     }
 
     // 轮询驱动与抬起探测：给速度按钮挂 RepeatForever(Sequence(DelayTime, CallFunc))，
