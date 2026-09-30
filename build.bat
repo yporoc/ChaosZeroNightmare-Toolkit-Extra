@@ -29,6 +29,7 @@ pyinstaller --onefile --noconsole --name ChaosZero-Toolkit ^
   --add-data "rebuild_bundle.py;." ^
   --add-data "unpack_data.py;." ^
   --add-data "embedded_bundle_patcher.py;." ^
+  --add-data "ssra_zhcn.py;." ^
   --add-data "embedded_javascript\bgani.js;embedded_javascript" ^
   --add-data "embedded_javascript\boot.js;embedded_javascript" ^
   --add-data "embedded_javascript\bootres.js;embedded_javascript" ^
@@ -49,6 +50,8 @@ pyinstaller --onefile --noconsole --name ChaosZero-Toolkit ^
   --hidden-import=customtkinter ^
   --hidden-import=opencc ^
   --hidden-import=pefile ^
+  --hidden-import=zstandard ^
+  --hidden-import=xxhash ^
   --collect-all customtkinter ^
   --collect-all opencc ^
   chaoszero_toolkit_gui.py
@@ -63,6 +66,7 @@ if %errorlevel% neq 0 (
 echo.
 echo [3/3] Copying TSV files to dist...
 copy "text_ko_text.tsv" "dist\text_ko_text.tsv" >nul 2>&1
+copy "text_zht_text(纯繁转简).tsv" "dist\text_zht_text(纯繁转简).tsv" >nul 2>&1
 
 echo.
 echo ============================================
