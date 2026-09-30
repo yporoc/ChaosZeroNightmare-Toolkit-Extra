@@ -864,6 +864,22 @@ class ChaosZeroToolkit(ctk.CTk):
         )
         self.stop_btn.pack(side="right", padx=(0, 0))
 
+        self.ssra_btn = ctk.CTkButton(
+            frame,
+            text="🈯 繁转简(ssra)",
+            height=44,
+            width=150,
+            corner_radius=8,
+            fg_color="#313244",
+            hover_color="#45475A",
+            text_color="#F8FAFC",
+            border_width=1,
+            border_color=COLOR_BORDER,
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=14, weight="bold"),
+            command=self._start_ssra_zhcn
+        )
+        self.ssra_btn.pack(side="right", padx=(8, 8))
+
     def _build_progress_section(self, parent):
         frame = ctk.CTkFrame(parent, fg_color=COLOR_BG_CARD, corner_radius=10,
                              border_width=1, border_color=COLOR_BORDER)
@@ -1423,6 +1439,78 @@ class ChaosZeroToolkit(ctk.CTk):
     def _stop_translation(self):
         self._stop_requested = True
         self._log_line("正在停止...", "warn")
+
+    def _start_ssra_zhcn(self):
+        if self.is_running:
+            return
+        gameres = os.path.join(self.game_bin_path.get().strip(), "appdata", "cznlive", "gameres")
+        if not os.path.isfile(os.path.join(gameres, "manifest.ssra")):
+            messagebox.showwarning(
+                "未找到 ssra 资源",
+                "游戏目录下没有 gameres/manifest.ssra。\n"
+                "请确认游戏已更新到 ssra 资源版本且路径正确。")
+            return
+        if not messagebox.askyesno(
+                "繁转简（ssra）",
+                "将把官方繁中 text.db 转为简体并应用到游戏。\n\n"
+                "• 原文件自动备份，可随时还原\n"
+                "• 同步补丁器身份记录，避免启动时要求重新下载\n\n"
+                "继续？"):
+            return
+        self.is_running = True
+        self._stop_requested = False
+        self.start_btn.configure(state="disabled")
+        self.ssra_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._set_progress(0, "繁转简：开始...")
+        threading.Thread(target=self._run_ssra_zhcn, args=(gameres,), daemon=True).start()
+
+    def _run_ssra_zhcn(self, gameres):
+        try:
+            import ssra_zhcn
+            patch_dir = os.path.join(EXE_DIR, "zhcn_patch")
+            log = lambda m: self._log_line("  " + m)
+            self._set_progress(0.3, "繁转简：构建中...")
+            ssra_zhcn.build(gameres, patch_dir, log=log)
+            if self._stop_requested:
+                raise InterruptedError
+            self._set_progress(0.7, "繁转简：等待应用...")
+
+            def _ask_apply():
+                result = messagebox.askyesno(
+                    "构建完成 ✅",
+                    "补丁已生成到 " + patch_dir + "\n\n是否立即应用到游戏目录？")
+                try:
+                    if result:
+                        ssra_zhcn.apply(gameres, patch_dir, log=log)
+                        self._log_line("✅ 已应用，启动游戏即可看到简体中文", "ok")
+                    else:
+                        self._log_line("已跳过应用，补丁保留在 " + patch_dir, "info")
+                    self._set_progress(1.0, "繁转简完成！")
+                except Exception as e:
+                    self._log_line(f"应用失败: {e}", "error")
+                    self._set_progress(0, "应用失败")
+
+            self.after(0, _ask_apply)
+
+        except InterruptedError:
+            self._log_line("操作已被用户停止", "warn")
+            self._set_progress(0, "已停止")
+
+        except Exception as e:
+            self._log_line(f"错误: {e}", "error")
+            import traceback
+            self._log_line(traceback.format_exc())
+            self._set_progress(0, "出错")
+            self.after(0, lambda: messagebox.showerror("错误", f"繁转简失败:\n{e}"))
+
+        finally:
+            def _done():
+                self.is_running = False
+                self.start_btn.configure(state="normal")
+                self.ssra_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+            self.after(0, _done)
 
     def _run_translation(self):
         """后台线程：执行解包→翻译/注入→重新打包。"""
