@@ -66,7 +66,6 @@ if %errorlevel% neq 0 (
 echo.
 echo [3/3] Copying TSV files to dist...
 copy "text_ko_text.tsv" "dist\text_ko_text.tsv" >nul 2>&1
-copy "text_zht_text(纯繁转简).tsv" "dist\text_zht_text(纯繁转简).tsv" >nul 2>&1
 
 echo.
 echo ============================================
