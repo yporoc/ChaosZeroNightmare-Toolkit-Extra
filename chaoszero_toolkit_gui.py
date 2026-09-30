@@ -82,6 +82,8 @@ COPY_HINT_TOKENS = ("desktop", "downloads", "onedrive", "appdata", "sandbox",
                     "副本", "备份", "copy", "-old", "_old", "backup", "\\bak")
 SETTINGS_NAME = "toolkit_settings.json"
 
+APP_VERSION = "2.0.4"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包后，exe 实际运行目录（而非临时解压目录）
 # Nuitka: __nuitka_binary_dir 或 __compiled__；PyInstaller: sys.frozen
@@ -560,8 +562,9 @@ class ChaosZeroToolkit(ctk.CTk):
         # State
         self.game_bin_path = ctk.StringVar(value="")
         self.pack_dir = ""
-        self.volumes_found = []
+        self.gameres_dir = ""
         self.has_zht = False
+        self.tsv_path = None
         self.is_running = False
         self._locate_cancel = threading.Event()
         self._locating = False
@@ -589,7 +592,7 @@ class ChaosZeroToolkit(ctk.CTk):
 
         version_label = ctk.CTkLabel(
             title_frame,
-            text="v1.0.2",
+            text="v" + APP_VERSION,
             font=ctk.CTkFont(family="Consolas", size=12),
             text_color=COLOR_TEXT_DIM
         )
@@ -761,9 +764,9 @@ class ChaosZeroToolkit(ctk.CTk):
         self.status_labels = {}
         indicators = [
             ("exe", "游戏启动器", "⏳ 等待选择"),
-            ("volumes", "数据分卷", "⏳ 等待选择"),
-            ("zht", "繁中语言包", "⏳ 等待检测"),
-            ("tsv", "汉化文本库", "⏳ 等待检测"),
+            ("manifest", "manifest.ssra", "⏳ 等待检测"),
+            ("part", "lang_zht_b03_0.ssrc", "⏳ 等待检测"),
+            ("etag", "manifest.ssra.etag", "⏳ 等待检测"),
         ]
         for col, (key, title, default) in enumerate(indicators):
             card = ctk.CTkFrame(grid, fg_color="#313244", corner_radius=6,
@@ -863,6 +866,22 @@ class ChaosZeroToolkit(ctk.CTk):
             state="disabled"
         )
         self.stop_btn.pack(side="right", padx=(0, 0))
+
+        self.ssra_btn = ctk.CTkButton(
+            frame,
+            text="繁转简 (ssra)",
+            height=44,
+            width=150,
+            corner_radius=8,
+            fg_color="#313244",
+            hover_color="#45475A",
+            text_color="#F8FAFC",
+            border_width=1,
+            border_color=COLOR_BORDER,
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=14, weight="bold"),
+            command=self._start_ssra_zhcn
+        )
+        self.ssra_btn.pack(side="right", padx=(8, 8))
 
     def _build_progress_section(self, parent):
         frame = ctk.CTkFrame(parent, fg_color=COLOR_BG_CARD, corner_radius=10,
@@ -1241,145 +1260,41 @@ class ChaosZeroToolkit(ctk.CTk):
         else:
             self._log_line(f"内嵌注入脚本不可用: {embedded_js_error}", "warn")
 
-        # 2. 检查 data.pack 分卷
-        pack_dir = os.path.join(bin_path, "appdata", "cznlive")
-        self.pack_dir = pack_dir
-        self.volumes_found = []
+        # 2. 检查 ssra 资源（繁转简的三个目标文件）
+        gameres = os.path.join(bin_path, "appdata", "cznlive", "gameres")
+        self.gameres_dir = gameres
+        targets = (
+            ("manifest", "manifest.ssra", "manifest.ssra"),
+            ("part", "lang_zht_b03_0.ssrc", os.path.join("chunks", "lang_zht_b03_0.ssrc")),
+            ("etag", "manifest.ssra.etag", "manifest.ssra.etag"),
+        )
+        ssra_found = 0
+        for key, title, rel in targets:
+            p = os.path.join(gameres, rel)
+            if os.path.isfile(p):
+                ssra_found += 1
+                sz = os.path.getsize(p)
+                size = "%.1f MB" % (sz / 1024**2) if sz >= 1024**2 else "%d B" % sz
+                self._set_status(key, f"✅ {size}", True)
+                self._log_line(f"找到 {title} ({size}): {p}", "ok")
+            else:
+                self._set_status(key, "❌ 未找到", False)
+                self._log_line(f"未找到 {title}: {p}", "warn")
 
-        if os.path.exists(pack_dir):
-            pack_base = os.path.join(pack_dir, "data.pack")
-            if os.path.exists(pack_base):
-                self.volumes_found.append(pack_base)
-                n = 1
-                while True:
-                    vpath = f"{pack_base}~{n}"
-                    if not os.path.exists(vpath):
-                        break
-                    self.volumes_found.append(vpath)
-                    n += 1
-
-        if self.volumes_found:
-            total_gb = sum(os.path.getsize(v) for v in self.volumes_found) / 1024**3
-            vol_text = f"✅ {len(self.volumes_found)} 卷 ({total_gb:.2f} GB)"
-            self._set_status("volumes", vol_text, True)
-            self._log_line(f"找到 {len(self.volumes_found)} 个分卷, 总计 {total_gb:.2f} GB", "ok")
-            for v in self.volumes_found:
-                sz = os.path.getsize(v) / 1024**2
-                self._log_line(f"  → {os.path.basename(v)}: {sz:.0f} MB")
-        else:
-            self._set_status("volumes", "❌ 未找到", False)
-            self._log_line(f"未找到 data.pack，路径: {pack_dir}", "error")
-
-        # 3. 检查 ZHT 语言包是否已下载
-        self.has_zht = self._check_zht_in_pack()
-        if self.has_zht:
-            self._set_status("zht", "✅ 已下载", True)
-            self._log_line("ZHT (繁体中文) 语言包已存在于 data.pack 中", "ok")
-            if hasattr(self, 'use_simplified_cb'):
-                self.use_simplified_cb.configure(state="normal")
-                self.use_local_zht_cb.configure(state="normal")
-        else:
-            self._set_status("zht", "⚠ 未下载", False)
-            self._log_line("ZHT 语言包未下载，可切换替换 KO (韩文) 版本", "warn")
-            if hasattr(self, 'use_simplified_cb'):
-                self.use_simplified_cb.configure(state="disabled")
-                self.use_simplified_var.set(False)
-                self.use_local_zht_cb.configure(state="disabled")
-                self.use_local_zht_var.set(False)
-
-        # 4. 检查 TSV 翻译文件（优先从 exe 所在目录查找）
-        tsv_path = os.path.join(EXE_DIR, "text_ko_text.tsv")
-        if not os.path.exists(tsv_path):
-            # 回退到脚本目录，再回退到仓库根（py/ 布局下 TSV 唯一副本在上级）
-            for _cand in (
-                os.path.join(SCRIPT_DIR, "text_ko_text.tsv"),
-                os.path.join(os.path.dirname(SCRIPT_DIR), "text_ko_text.tsv"),
-            ):
-                if os.path.exists(_cand):
-                    tsv_path = _cand
-                    break
-
-        if os.path.exists(tsv_path):
-            sz = os.path.getsize(tsv_path) / 1024
-            self._set_status("tsv", f"✅ {sz:.0f} KB", True)
-            self._log_line(f"翻译 TSV: {tsv_path} ({sz:.0f} KB)", "ok")
-            self.tsv_path = tsv_path
-        else:
-            self._set_status("tsv", "❌ 未找到", False)
-            self._log_line("未找到翻译文件 text_ko_text.tsv", "error")
-            self.tsv_path = None
-
-        # 启用/禁用开始按钮（汉化与加速生成任一可用即可）
-        can_start_hanhua = len(self.volumes_found) > 0 and self.tsv_path is not None
+        # 繁转简与加速生成任一可用即可
+        can_start_ssra = ssra_found == len(targets)
         can_start_speed = exe_found and speed_assets_found
-        can_start = can_start_hanhua or can_start_speed
-        self.start_btn.configure(state="normal" if can_start else "disabled")
+        self.ssra_btn.configure(state="normal" if can_start_ssra else "disabled")
+        self.start_btn.configure(state="normal" if can_start_speed else "disabled")
 
-        if can_start_hanhua and can_start_speed:
-            self._log_line("检测完成，可以开始汉化及自动生成加速 EXE！", "ok")
-        elif can_start_hanhua:
-            self._log_line("检测完成，可以开始汉化！", "ok")
+        if can_start_ssra and can_start_speed:
+            self._log_line("检测完成：繁转简与加速 EXE 均可用！", "ok")
+        elif can_start_ssra:
+            self._log_line("检测完成：可以进行繁转简！", "ok")
         elif can_start_speed:
             self._log_line("检测完成，可以基于当前游戏版本生成加速 EXE！", "ok")
         else:
             self._log_line("检测完成，部分条件不满足，请检查", "warn")
-
-    def _check_zht_in_pack(self):
-        """Quick check: scan the pack for text/zht/text.db entry."""
-        if not self.volumes_found:
-            return False
-        try:
-            # 导入核心模块的加密函数
-            sys.path.insert(0, SCRIPT_DIR)
-            from rebuild_ko_to_zht import MultiVolumePack, cdbm_hash, PACK_XOR_KEY
-            import numpy as np
-
-            pack = MultiVolumePack(self.pack_dir)
-            _PACK_XOR_NP = np.frombuffer(PACK_XOR_KEY, dtype=np.uint8)
-
-            # 读取 header 获取 hash_count
-            hdr = pack.read_xor(0, 38)
-            if hdr[:5] != b'PLPcK':
-                pack.close()
-                return False
-            hash_count = struct.unpack_from('<I', hdr, 21)[0]
-
-            # 查找 ZHT bucket
-            zht_key = b'text/zht/text.db'
-            bucket = cdbm_hash(zht_key) % hash_count
-
-            ht_data = pack.read_xor(43, hash_count * 5)
-            off5 = bucket * 5
-            ptr_hi = ht_data[off5]
-            ptr_lo = struct.unpack_from('<I', ht_data[off5+1:off5+5])[0]
-            chain = ptr_lo + (ptr_hi << 32)
-
-            found = False
-            safety = 0
-            while chain > 0 and chain + 15 <= pack.total_size and safety < 100:
-                safety += 1
-                chunk_hdr = pack.read_xor(chain, 15)
-                ds = struct.unpack_from('<I', chunk_hdr, 0)[0]
-                kl = chunk_hdr[5]
-                vs = struct.unpack_from('<I', chunk_hdr, 6)[0]
-                if ds == 0 or kl == 0:
-                    break
-                key = pack.read_xor(chain + 15, kl)
-                if key == zht_key and vs > 1000:  # ZHT exists with real data
-                    found = True
-                    break
-                nh = chunk_hdr[10]
-                nl = struct.unpack_from('<I', chunk_hdr, 11)[0]
-                np_ = nl + (nh << 32)
-                if np_ == 0 or np_ == chain:
-                    break
-                chain = np_
-
-            pack.close()
-            return found
-        except Exception as e:
-            self._log_line(f"ZHT 检测异常: {e}", "warn")
-            return False
 
     # ═══════════════════════════════════════════════════════════════
     # 汉化核心流程
@@ -1423,6 +1338,78 @@ class ChaosZeroToolkit(ctk.CTk):
     def _stop_translation(self):
         self._stop_requested = True
         self._log_line("正在停止...", "warn")
+
+    def _start_ssra_zhcn(self):
+        if self.is_running:
+            return
+        gameres = os.path.join(self.game_bin_path.get().strip(), "appdata", "cznlive", "gameres")
+        if not os.path.isfile(os.path.join(gameres, "manifest.ssra")):
+            messagebox.showwarning(
+                "未找到 ssra 资源",
+                "游戏目录下没有 gameres/manifest.ssra。\n"
+                "请确认游戏已更新到 ssra 资源版本且路径正确。")
+            return
+        if not messagebox.askyesno(
+                "繁转简（ssra）",
+                "将把官方繁中 text.db 转为简体并应用到游戏。\n\n"
+                "• 原文件自动备份，可随时还原\n"
+                "• 同步补丁器身份记录，避免启动时要求重新下载\n\n"
+                "继续？"):
+            return
+        self.is_running = True
+        self._stop_requested = False
+        self.start_btn.configure(state="disabled")
+        self.ssra_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._set_progress(0, "繁转简：开始...")
+        threading.Thread(target=self._run_ssra_zhcn, args=(gameres,), daemon=True).start()
+
+    def _run_ssra_zhcn(self, gameres):
+        try:
+            import ssra_zhcn
+            patch_dir = os.path.join(EXE_DIR, "zhcn_patch")
+            log = lambda m: self._log_line("  " + m)
+            self._set_progress(0.3, "繁转简：构建中...")
+            ssra_zhcn.build(gameres, patch_dir, log=log)
+            if self._stop_requested:
+                raise InterruptedError
+            self._set_progress(0.7, "繁转简：等待应用...")
+
+            def _ask_apply():
+                result = messagebox.askyesno(
+                    "构建完成 ✅",
+                    "补丁已生成到 " + patch_dir + "\n\n是否立即应用到游戏目录？")
+                try:
+                    if result:
+                        ssra_zhcn.apply(gameres, patch_dir, log=log)
+                        self._log_line("已应用，启动游戏即可看到简体中文", "ok")
+                    else:
+                        self._log_line("已跳过应用，补丁保留在 " + patch_dir, "info")
+                    self._set_progress(1.0, "繁转简完成！")
+                except Exception as e:
+                    self._log_line(f"应用失败: {e}", "error")
+                    self._set_progress(0, "应用失败")
+
+            self.after(0, _ask_apply)
+
+        except InterruptedError:
+            self._log_line("操作已被用户停止", "warn")
+            self._set_progress(0, "已停止")
+
+        except Exception as e:
+            self._log_line(f"错误: {e}", "error")
+            import traceback
+            self._log_line(traceback.format_exc())
+            self._set_progress(0, "出错")
+            self.after(0, lambda: messagebox.showerror("错误", f"繁转简失败:\n{e}"))
+
+        finally:
+            def _done():
+                self.is_running = False
+                self.start_btn.configure(state="normal")
+                self.ssra_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+            self.after(0, _done)
 
     def _run_translation(self):
         """后台线程：执行解包→翻译/注入→重新打包。"""
