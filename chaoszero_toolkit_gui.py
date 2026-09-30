@@ -589,7 +589,7 @@ class ChaosZeroToolkit(ctk.CTk):
 
         version_label = ctk.CTkLabel(
             title_frame,
-            text="v1.0.2",
+            text="v2.0.4",
             font=ctk.CTkFont(family="Consolas", size=12),
             text_color=COLOR_TEXT_DIM
         )
