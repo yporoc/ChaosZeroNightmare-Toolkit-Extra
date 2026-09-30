@@ -82,6 +82,8 @@ COPY_HINT_TOKENS = ("desktop", "downloads", "onedrive", "appdata", "sandbox",
                     "副本", "备份", "copy", "-old", "_old", "backup", "\\bak")
 SETTINGS_NAME = "toolkit_settings.json"
 
+APP_VERSION = "2.0.4"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包后，exe 实际运行目录（而非临时解压目录）
 # Nuitka: __nuitka_binary_dir 或 __compiled__；PyInstaller: sys.frozen
@@ -590,7 +592,7 @@ class ChaosZeroToolkit(ctk.CTk):
 
         version_label = ctk.CTkLabel(
             title_frame,
-            text="v2.0.4",
+            text="v" + APP_VERSION,
             font=ctk.CTkFont(family="Consolas", size=12),
             text_color=COLOR_TEXT_DIM
         )
