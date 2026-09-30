@@ -339,11 +339,11 @@ def status(gameres, patch_dir, log=print):
 
 def main():
     import sys
-    here = os.path.dirname(os.path.abspath(__file__))
-    gameres = sys.argv[1] if len(sys.argv) > 1 else \
-        r'C:\LEGION\Games\ChaosZeroNightmare\bin\appdata\cznlive\gameres'
-    patch = os.path.join(here, 'zhcn_patch')
-    cmd = sys.argv[2] if len(sys.argv) > 2 else 'apply'
+    if len(sys.argv) < 3:
+        print('用法: python ssra_zhcn.py <gameres目录> build|apply|restore|status')
+        return
+    gameres, cmd = sys.argv[1], sys.argv[2]
+    patch = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zhcn_patch')
     if cmd == 'build':
         build(gameres, patch)
     elif cmd == 'apply':
