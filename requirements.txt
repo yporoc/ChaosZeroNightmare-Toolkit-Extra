@@ -6,3 +6,5 @@ numpy==2.5.2
 customtkinter==6.0.0
 opencc-python-reimplemented==0.1.7
 pefile==2024.8.26
+zstandard==0.25.0
+xxhash==4.0.1
