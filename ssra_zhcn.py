@@ -325,15 +325,14 @@ def sync_identity(gameres, log=print):
 def apply(gameres, patch_dir, log=print):
     # 分卷在 gameres 下位于 chunks/ 子目录，补丁目录里则是平铺文件名
     items = [('manifest.ssra', 'manifest.ssra'),
-             (os.path.join('chunks', TARGET_PART), TARGET_PART),
-             (ETAG_REL, ETAG_REL)]
+             (os.path.join('chunks', TARGET_PART), TARGET_PART)]
     bd = os.path.join(patch_dir, BACKUP_SUBDIR)
     os.makedirs(bd, exist_ok=True)
     for rel, pname in items:
         assert os.path.isfile(os.path.join(patch_dir, pname)), pname
-    for rel, pname in items:
+    for rel, pname in items + [(ETAG_REL, ETAG_REL)]:
         src = os.path.join(gameres, rel)
-        dst = os.path.join(bd, rel.replace('/', '__') + '.bak')
+        dst = os.path.join(bd, rel.replace(chr(92), '__').replace('/', '__') + '.bak')
         if os.path.isfile(src) and not os.path.isfile(dst):
             open(dst, 'wb').write(open(src, 'rb').read())
             log('备份 %s' % rel)
@@ -347,7 +346,7 @@ def apply(gameres, patch_dir, log=print):
 def restore(gameres, patch_dir, log=print):
     bd = os.path.join(patch_dir, BACKUP_SUBDIR)
     for rel in (os.path.join('chunks', TARGET_PART), 'manifest.ssra', ETAG_REL):
-        bak = os.path.join(bd, rel.replace('/', '__') + '.bak')
+        bak = os.path.join(bd, rel.replace(chr(92), '__').replace('/', '__') + '.bak')
         assert os.path.isfile(bak), bak
         open(os.path.join(gameres, rel), 'wb').write(open(bak, 'rb').read())
         log('还原 %s' % rel)
