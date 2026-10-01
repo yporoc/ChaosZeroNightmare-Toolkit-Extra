@@ -257,21 +257,45 @@ def build(gameres, out_dir, log=print):
         want = expect.get(e[0], orig_by_key[e[0]])
         assert e[1] == want, '值不一致: %r' % e[0][:40]
     log('自检通过: %d 条，键集/桶分配/值全部一致' % len(e2))
+    if not new_values:
+        log('官方 text.db 已全部为简体，无需转换（生成的补丁与官方内容一致）')
 
+    # 分卷必须与官方逐字节同尺寸：CDN 上的分卷尺寸固定，任何按 manifest 尺寸
+    # 发起的 Range 请求一旦超出官方 EOF 就会 HTTP 416 并死循环（实测 E22411）。
+    # 因此帧压缩到不超过原始 comp 尺寸，再用标准 zstd skippable frame 垫满，
+    # manifest 里只允许 XXH64 一个字段与官方不同。
+    orig_comp, orig_dec = f['comp'], f['dec']
+    assert len(newdb) == orig_dec, '转换改变了 text.db 尺寸（%d != %d），会破坏分卷尺寸一致性' % (
+        len(newdb), orig_dec)
     newdb_enc = _inner_decrypt(newdb, phase)
-    frame = zstd.ZstdCompressor(level=3).compress(newdb_enc)
-    pad = b'\x00' * ((-len(frame)) % 16)
-    payload = orig_part[:local] + frame + pad
+    frame = None
+    for lvl in (3, 6, 9, 12, 16, 19):
+        cand = zstd.ZstdCompressor(level=lvl).compress(newdb_enc)
+        if len(cand) <= orig_comp:
+            frame = cand
+            break
+    assert frame is not None, '无法压缩到原始帧尺寸以内'
+    pad_total = orig_comp - len(frame)
+    if pad_total:
+        n = pad_total - 8
+        frame += b'\x50\x2a\x4d\x18' + struct.pack('<I', n) + b'\x00' * n
+    assert len(frame) == orig_comp
+    import io
+    assert zstd.ZstdDecompressor().stream_reader(
+        io.BytesIO(frame), read_across_frames=True).read() == newdb_enc, '垫帧回读不一致'
+
+    payload = orig_part[:local] + frame + orig_part[local + orig_comp:len(orig_part) - 16]
+    assert len(payload) == len(orig_part) - 16
     part_idx = [idx for idx, k, s, e in S.gcum[f['grp']][1] if k == part_k][0]
     new_part = payload + b'SSRC' + struct.pack('<I', part_idx) + \
         struct.pack('<Q', xxhash.xxh64(payload).intdigest())
+    assert len(new_part) == len(orig_part), '分卷尺寸与官方不一致'
 
     man = bytearray(open(os.path.join(gameres, 'manifest.ssra'), 'rb').read())
     o = 0x40 + part_k * 32
-    struct.pack_into('<QQQ', man, o + 8, len(new_part) - 16, len(new_part),
-                     xxhash.xxh64(new_part[:-16]).intdigest())
-    fo = S.files_off + f['k'] * 40
-    struct.pack_into('<II', man, fo + 16, len(frame), len(newdb))
+    old_a, old_b = struct.unpack_from('<QQ', man, o + 8)
+    assert (len(new_part) - 16, len(new_part)) == (old_a, old_b), '分卷尺寸字段意外变化'
+    struct.pack_into('<Q', man, o + 24, xxhash.xxh64(new_part[:-16]).intdigest())
     man = bytes(man)
 
     os.makedirs(out_dir, exist_ok=True)
@@ -299,27 +323,30 @@ def sync_identity(gameres, log=print):
 
 
 def apply(gameres, patch_dir, log=print):
-    for rel in ('manifest.ssra', TARGET_PART):
-        assert os.path.isfile(os.path.join(patch_dir, rel)), rel
+    # 分卷在 gameres 下位于 chunks/ 子目录，补丁目录里则是平铺文件名
+    items = [('manifest.ssra', 'manifest.ssra'),
+             (os.path.join('chunks', TARGET_PART), TARGET_PART)]
     bd = os.path.join(patch_dir, BACKUP_SUBDIR)
     os.makedirs(bd, exist_ok=True)
-    for rel in ('manifest.ssra', TARGET_PART, ETAG_REL):
+    for rel, pname in items:
+        assert os.path.isfile(os.path.join(patch_dir, pname)), pname
+    for rel, pname in items + [(ETAG_REL, ETAG_REL)]:
         src = os.path.join(gameres, rel)
-        dst = os.path.join(bd, rel.replace('/', '__') + '.bak')
+        dst = os.path.join(bd, rel.replace(chr(92), '__').replace('/', '__') + '.bak')
         if os.path.isfile(src) and not os.path.isfile(dst):
             open(dst, 'wb').write(open(src, 'rb').read())
             log('备份 %s' % rel)
-    for rel in ('manifest.ssra', TARGET_PART):
+    for rel, pname in items:
         open(os.path.join(gameres, rel), 'wb').write(
-            open(os.path.join(patch_dir, rel), 'rb').read())
+            open(os.path.join(patch_dir, pname), 'rb').read())
         log('应用 %s' % rel)
     sync_identity(gameres, log)
 
 
 def restore(gameres, patch_dir, log=print):
     bd = os.path.join(patch_dir, BACKUP_SUBDIR)
-    for rel in (TARGET_PART, 'manifest.ssra', ETAG_REL):
-        bak = os.path.join(bd, rel.replace('/', '__') + '.bak')
+    for rel in (os.path.join('chunks', TARGET_PART), 'manifest.ssra', ETAG_REL):
+        bak = os.path.join(bd, rel.replace(chr(92), '__').replace('/', '__') + '.bak')
         assert os.path.isfile(bak), bak
         open(os.path.join(gameres, rel), 'wb').write(open(bak, 'rb').read())
         log('还原 %s' % rel)
