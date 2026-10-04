@@ -25,7 +25,6 @@ echo.
 
 echo [2/2] Building exe with PyInstaller...
 pyinstaller --onefile --noconsole --name ChaosZero-Toolkit ^
-  --add-data "rebuild_bundle.py;." ^
   --add-data "unpack_data.py;." ^
   --add-data "embedded_bundle_patcher.py;." ^
   --add-data "ssra_zhcn.py;." ^

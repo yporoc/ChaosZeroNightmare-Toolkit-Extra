@@ -1,30 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# v2.0 build layout: 17 game js files embedded under embedded_javascript/,
 from PyInstaller.utils.hooks import collect_all
 
-datas = [
-    ('rebuild_bundle.py', '.'),
-    ('unpack_data.py', '.'),
-    ('embedded_bundle_patcher.py', '.'),
-    ('ssra_zhcn.py', '.'),
-    ('embedded_javascript\\bgani.js', 'embedded_javascript'),
-    ('embedded_javascript\\boot.js', 'embedded_javascript'),
-    ('embedded_javascript\\bootres.js', 'embedded_javascript'),
-    ('embedded_javascript\\cheat.js', 'embedded_javascript'),
-    ('embedded_javascript\\entry_util.js', 'embedded_javascript'),
-    ('embedded_javascript\\init.js', 'embedded_javascript'),
-    ('embedded_javascript\\pre_data.js', 'embedded_javascript'),
-    ('embedded_javascript\\publisher_base.js', 'embedded_javascript'),
-    ('embedded_javascript\\publisher_stove.js', 'embedded_javascript'),
-    ('embedded_javascript\\publisher_xcent.js', 'embedded_javascript'),
-    ('embedded_javascript\\resolution.js', 'embedded_javascript'),
-    ('embedded_javascript\\title.js', 'embedded_javascript'),
-    ('embedded_javascript\\title_popups.js', 'embedded_javascript'),
-    ('embedded_javascript\\ttfwork.js', 'embedded_javascript'),
-    ('embedded_javascript\\util.js', 'embedded_javascript'),
-    ('embedded_javascript\\work_dynamic_atlas.js', 'embedded_javascript'),
-    ('embedded_javascript\\work_font_atlas.js', 'embedded_javascript'),
-]
+datas = [('unpack_data.py', '.'), ('embedded_bundle_patcher.py', '.'), ('ssra_zhcn.py', '.'), ('embedded_javascript', 'embedded_javascript')]
 binaries = []
 hiddenimports = ['customtkinter', 'opencc', 'pefile', 'zstandard', 'xxhash']
 tmp_ret = collect_all('customtkinter')
