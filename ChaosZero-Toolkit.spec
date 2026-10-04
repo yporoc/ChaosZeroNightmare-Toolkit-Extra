@@ -3,10 +3,10 @@
 from PyInstaller.utils.hooks import collect_all
 
 datas = [
-    ('rebuild_ko_to_zht.py', '.'),
     ('rebuild_bundle.py', '.'),
     ('unpack_data.py', '.'),
     ('embedded_bundle_patcher.py', '.'),
+    ('ssra_zhcn.py', '.'),
     ('embedded_javascript\\bgani.js', 'embedded_javascript'),
     ('embedded_javascript\\boot.js', 'embedded_javascript'),
     ('embedded_javascript\\bootres.js', 'embedded_javascript'),
@@ -26,7 +26,7 @@ datas = [
     ('embedded_javascript\\work_font_atlas.js', 'embedded_javascript'),
 ]
 binaries = []
-hiddenimports = ['customtkinter', 'opencc', 'pefile']
+hiddenimports = ['customtkinter', 'opencc', 'pefile', 'zstandard', 'xxhash']
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('opencc')

@@ -1,6 +1,7 @@
 # === 构建产物 ===
 build/
 dist/
+output/
 *.spec.bak
 nuitka-crash-report.xml
 ChaosZero-Toolkit.exe
@@ -15,6 +16,7 @@ __pycache__/
 # === 工具运行时产物（不入库） ===
 SPEED_LOG.txt
 speed_config.txt
+toolkit_settings.json
 unpacked/
 bundle_rebuilt.pack
 bin_full_rebuild/

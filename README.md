@@ -8,19 +8,23 @@
 
 ### 原作者 V2.0 原有功能
 
-- **汉化**：一键替换游戏文本库（繁体转简体）
 - **变速齿轮**：`F9` 加速（2x/3x/5x）· `F10` 重置 1x · `F11` 动画跳过 · `F12` 显隐 UI
 - 按键可在 `speed_config.txt` 自定义
 - 直接补丁游戏 EXE 内嵌脚本，游戏更新后重新补丁原始 exe 自动适配
 
-### 社区维护版 V2.0.2 新增功能
+### 社区维护版新增功能
 
-- **`F8` 强制回主界面**（复位 1x 并关闭动画跳过）：相当于无需代理的进程内重启。用于解决更新失败弹窗、各种出现 bug 的 UI 窗口无法交互甚至无法恢复的情况，免于开启代理或加速从 STOVE 重新启动游戏。
-- **状态记忆**：倍速与动画跳过状态自动记忆——自动保存最后一次更改后的设置状态至 config，下次启动游戏后自动应用。只有 `F8` 强制重置和玩家手动更改会改变记忆状态。
+- **繁转简（ssra）**：适配游戏新的 ssra 资源体系（`gameres/manifest.ssra` + `chunks/*.ssrc`），提取官方繁中 `text/zht/text.db` → OpenCC 转简 → 与官方逐字节同尺寸重建分卷并应用；原文件自动备份、可一键还原；同步补丁器身份记录，patching 不再要求重新下载。这是当前唯一的汉化路径（旧 data.pack 汉化线已随资源体系迁移退役）
+- **`F8` 强制回主界面**（复位 1x 并关闭动画跳过）：相当于无需代理的进程内重启
+- **状态记忆**：倍速与动画跳过状态自动记忆，重启游戏后自动应用
+- **按下期瞬时 1x**：修复高倍速下轻点被误判为长按的问题
+- **`keepalive_sec`**：倍速被游戏改回后的维持周期可配置
+- **管理员助手**：启动时检测当前权限并在标题栏常驻显示；未提权时执行功能前会醒目提醒，可一键以管理员身份重启工具，无需右键「以管理员身份运行」
+- **现代卡片式 GUI**：步骤化布局、就绪检测芯片、日志合帧刷新、高分屏清晰渲染（Win10/11 显示缩放适配）
 
 ## 使用
 
-从 [Releases](../../releases) 下载压缩包，解压到游戏目录 `ChaosZeroNightmare` **所在的同一目录**，运行 `ChaosZero-Toolkit.exe`。按需对原 exe 和 `data.pack` 进行补丁和替换即可。
+从 [Releases](../../releases) 下载压缩包，解压到游戏目录 `ChaosZeroNightmare` **所在的同一目录**，运行 `ChaosZero-Toolkit.exe`（未提权时工具会提示并可直接申请管理员）。按需使用「繁转简」或「生成加速 EXE」即可。
 
 配置与日志写入**工具自身所在目录**（`speed_config.txt` / `SPEED_LOG.txt`）。
 
@@ -36,9 +40,9 @@
    - **写入 17 个明文 JS**：来源是工具目录的 `embedded_javascript/`，落点是 ZIP 内 `pre/javascript/`（原版 ZIP 里本来没有这个目录）
 3. **定长重建** — 差值用 ZIP comment / `pre/dummy_padding.bin` 吸收，产物与原 EXE 字节数完全相同 → 写回
 
-**汉化**
+**汉化（ssra 繁转简）**
 
-解密 `data.pack`（PLPcK 容器：外层 XOR-129 循环密钥 LCG seed=150812，内层 256 字节仅作用于 `.db`）→ 取出 `text/ko/text.db` → 套 TSV 翻译 → 重建写回。
+`manifest.ssra` 记录文件在分卷组中的位置；`.ssrc` 分卷为 zstd 帧 + 16B footer（`SSRC`/卷号/XXH64）；`text.db` 为 PLPcK v1 容器，存储态带 256B 内层 XOR（相位逐文件固定）。转换后用标准 zstd skippable frame 垫帧，保证重建分卷与官方**逐字节同尺寸**（CDN 按尺寸发 Range 请求，尺寸不一致会导致 416 死循环），并同步 `manifest.ssra.etag` 身份记录。
 
 ## 构建
 
@@ -49,14 +53,17 @@ build.bat          # 输出 dist/ChaosZero-Toolkit.exe
 
 直接运行源码：`python chaoszero_toolkit_gui.py`
 
+一键构建发布：`python make_release.py build|publish`
+
 ## 目录
 
 | 路径 | 说明 |
 |---|---|
 | `chaoszero_toolkit_gui.py` | GUI 主程序 |
 | `embedded_javascript/` | 17 个内嵌脚本（`init.js` 为变速核心） |
-| `rebuild_ko_to_zht.py` · `rebuild_bundle.py` · `unpack_data.py` | 汉化重建 / 封包 / 解包 |
-| `text_ko_text.tsv` · `text_zht_text(纯繁转简).tsv` | 汉化文本库 |
+| `embedded_bundle_patcher.py` | 加速 EXE 注入核心 |
+| `ssra_zhcn.py` | ssra 繁转简核心（含 CLI） |
+| `unpack_data.py` · `rebuild_bundle.py` | data.pack 解包 / bundle.pack 重建（独立命令行工具） |
 
 ## 许可
 
