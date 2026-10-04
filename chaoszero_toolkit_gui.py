@@ -83,7 +83,7 @@ COPY_HINT_TOKENS = ("desktop", "downloads", "onedrive", "appdata", "sandbox",
                     "副本", "备份", "copy", "-old", "_old", "backup", "\\bak")
 SETTINGS_NAME = "toolkit_settings.json"
 
-APP_VERSION = "2.0.4fix"
+APP_VERSION = "2.0.4fix2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包后，exe 实际运行目录（而非临时解压目录）
@@ -141,6 +141,31 @@ def is_windows_admin():
             ctypes.windll.kernel32.CloseHandle(token)
     except Exception:
         return False
+
+
+def is_uac_disabled():
+    """EnableLUA=0 = 系统层面关闭了 UAC：没有提权 broker，runas 必然静默失败
+    （点「提权」不会有任何弹窗，实测复现）。此时只能换管理员账户运行或重开 UAC。
+    注意 EnableLUA=0 时管理员账户的进程天生全权令牌，本判断只在未提权时才会被走到。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                            0, winreg.KEY_READ) as key:
+            value, _type = winreg.QueryValueEx(key, "EnableLUA")
+            return int(value) == 0
+    except OSError:
+        return False
+
+
+# ShellExecuteExW 失败时的常见 Win32 错误 → 用户能看懂的提示
+ELEV_ERR_HINTS = {
+    1223: "UAC 弹窗被取消（点了「否」，或系统策略自动拒绝标准用户的提权请求）",
+    5: "访问被拒绝（提权请求被安全软件或组策略拦截）",
+    1260: "组策略禁止在此计算机上提权",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -633,7 +658,7 @@ class ChaosZeroToolkit(ctk.CTk):
         bar.pack_propagate(False)
 
         ctk.CTkLabel(
-            bar, text="⚔ ChaosZero Toolkit",
+            bar, text="ChaosZero Toolkit",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=21, weight="bold"),
             text_color="#FFFFFF"
         ).pack(side="left", padx=20, pady=15)
@@ -760,12 +785,11 @@ class ChaosZeroToolkit(ctk.CTk):
 
         grid = ctk.CTkFrame(frame, fg_color="transparent")
         grid.pack(fill="x", padx=15, pady=(0, 15))
-        grid.columnconfigure((0, 1, 2, 3, 4), weight=1)
+        grid.columnconfigure((0, 1, 2, 3), weight=1)
 
         self.status_labels = {}
         indicators = [
             ("exe", "游戏启动器 EXE", "等待检测"),
-            ("js", "内嵌脚本 ×17", "等待检测"),
             ("manifest", "manifest.ssra", "等待检测"),
             ("part", "lang_zht_b03_0.ssrc", "等待检测"),
             ("etag", "manifest.ssra.etag", "等待检测"),
@@ -1048,24 +1072,64 @@ class ChaosZeroToolkit(ctk.CTk):
         return False
 
     def _elevate_restart(self):
-        """以管理员身份重新启动本工具（触发 UAC），成功后退出当前实例。"""
+        """以管理员身份重新启动本工具（触发 UAC），成功后退出当前实例。
+        用 ShellExecuteExW 而非 ShellExecuteW：失败时拿得到确切 Win32 错误码，
+        「点了没反应」永远有诊断出口。"""
+        if self.is_running:
+            self._log_line("任务进行中，请等完成或停止后再提权重启", "warn")
+            return False
+        if is_uac_disabled():
+            self._log_line("本机已关闭 UAC（EnableLUA=0），系统没有提权弹窗机制，无法在运行时申请管理员", "error")
+            self._log_line("请改用管理员账户运行本工具，或重新开启 UAC：控制面板 → 用户账户 → 更改用户账户控制设置（改后需重启生效）", "warn")
+            return False
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            exe = sys.executable
+            params = subprocess.list2cmdline([os.path.abspath(sys.argv[0])] + list(sys.argv[1:]))
+
+        class _ExecInfo(ctypes.Structure):
+            # SHELLEXECUTEINFOW，x64 下 112 字节
+            _fields_ = [
+                ("cbSize", ctypes.c_ulong), ("fMask", ctypes.c_ulong),
+                ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
+                ("lpFile", ctypes.c_wchar_p), ("lpParameters", ctypes.c_wchar_p),
+                ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+                ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
+                ("dwHotKey", ctypes.c_ulong), ("hIconOrMonitor", ctypes.c_void_p),
+                ("hProcess", ctypes.c_void_p),
+            ]
+
+        info = _ExecInfo()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = 0x40 | 0x100        # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+        info.lpVerb = "runas"            # 触发 UAC；已提权进程则静默通过
+        info.lpFile = exe
+        info.lpParameters = params or None
+        # lpDirectory 传工具目录：提权后实例的工作目录不变，配置与日志仍落在同一处
+        info.lpDirectory = EXE_DIR
+        info.nShow = 1                   # SW_SHOWNORMAL
+
+        self._log_line("正在请求管理员授权…（若弹出 UAC 请点「是」）", "info")
         try:
-            if getattr(sys, "frozen", False):
-                exe = sys.executable
-                params = subprocess.list2cmdline(sys.argv[1:])
-            else:
-                exe = sys.executable
-                params = subprocess.list2cmdline([os.path.abspath(sys.argv[0])] + list(sys.argv[1:]))
-            # lpDirectory 传工具目录：提权后实例的工作目录不变，配置与日志仍落在同一处
-            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, EXE_DIR, 1)
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_ExecInfo)]
+            shell32.ShellExecuteExW.restype = ctypes.c_int
+            ok = shell32.ShellExecuteExW(ctypes.byref(info))
         except Exception as exc:
             self._log_line(f"提权重启失败: {exc}", "error")
             return False
-        if int(rc & 0xFFFFFFFF) > 32:
-            self._log_line("已请求管理员授权，正在以管理员身份重启…（本窗口可关闭）", "ok")
+        if ok:
+            if info.hProcess:
+                ctypes.windll.kernel32.CloseHandle(info.hProcess)
+            self._log_line("管理员授权已通过，正在以管理员身份重启…（本窗口即将关闭）", "ok")
             self.after(400, self.destroy)
             return True
-        self._log_line("未获得管理员授权（UAC 已取消或被策略阻止）", "warn")
+        err = ctypes.get_last_error()
+        hint = ELEV_ERR_HINTS.get(err) or ctypes.FormatError(err)
+        self._log_line(f"未获得管理员授权（Win32 错误 {err}）：{hint}", "warn")
         return False
 
     # ═══════════════════════════════════════════════════════════════
@@ -1294,9 +1358,12 @@ class ChaosZeroToolkit(ctk.CTk):
         exe_path = os.path.join(bin_path, GAME_EXE_NAME)
         exe_found = os.path.isfile(exe_path)
 
-        # 1.5 检查内嵌注入脚本（加速 EXE 生成的前提）
+        # 1.5 内嵌注入脚本随 EXE 自释放（打包后在临时解压目录），不占检测区；
+        # 只作为加速生成的前置条件在后台确认，缺失时才提示
         embedded_js_dir, embedded_js_error = self._get_embedded_js_dir()
         speed_assets_found = bool(embedded_js_dir)
+        if not speed_assets_found:
+            self._log_line(f"内嵌注入脚本不可用: {embedded_js_error}", "warn")
 
         if exe_found:
             self._set_status("exe", f"✓ {GAME_EXE_NAME}", True)
@@ -1304,14 +1371,6 @@ class ChaosZeroToolkit(ctk.CTk):
         else:
             self._set_status("exe", "✗ 未找到", False)
             self._log_line(f"未找到 {GAME_EXE_NAME}，请确认路径正确", "warn")
-
-        if speed_assets_found:
-            self._set_status("js", "✓ 就绪", True)
-            self._log_line(f"内嵌注入脚本: {embedded_js_dir}（17 个 JS）", "ok")
-            self._log_line("加速 EXE 将基于当前游戏版本自动生成", "info")
-        else:
-            self._set_status("js", "✗ 不可用", False)
-            self._log_line(f"内嵌注入脚本不可用: {embedded_js_error}", "warn")
 
         # 2. 检查 ssra 资源（繁转简的三个目标文件）
         gameres = os.path.join(bin_path, "appdata", "cznlive", "gameres")
