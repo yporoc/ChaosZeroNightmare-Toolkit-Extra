@@ -18,6 +18,7 @@ SPEED_LOG.txt
 speed_config.txt
 toolkit_settings.json
 zhcn_patch/
+make_release.py
 unpacked/
 bundle_rebuilt.pack
 bin_full_rebuild/
