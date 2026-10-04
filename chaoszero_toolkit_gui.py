@@ -31,6 +31,7 @@ import glob
 import json
 import stat
 import ctypes
+import subprocess
 
 # ═══════════════════════════════════════════════════════════════════════
 # 主题配置
@@ -111,6 +112,35 @@ def enable_windows_dpi_awareness():
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def is_windows_admin():
+    """当前进程是否以管理员令牌运行（Win10/Win11 通用）。
+    主路 shell32.IsUserAnAdmin；不可用时退回 GetTokenInformation(TokenElevation)。
+    非 Windows 视为已提权，不影响源码自测。"""
+    if os.name != "nt":
+        return True
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return True
+    except Exception:
+        pass
+    try:
+        token = ctypes.c_void_p()
+        if not ctypes.windll.advapi32.OpenProcessToken(
+                ctypes.windll.kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            return False
+        try:
+            elev = ctypes.c_ulong()
+            ret = ctypes.c_ulong()
+            # 20 = TOKEN_ELEVATION：非零即提权令牌
+            ok = ctypes.windll.advapi32.GetTokenInformation(
+                token, 20, ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(ret))
+            return bool(ok and elev.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(token)
+    except Exception:
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -576,6 +606,10 @@ class ChaosZeroToolkit(ctk.CTk):
         self._log_flush_scheduled = False
 
         self._build_ui()
+        self._elevated = is_windows_admin()
+        self._log_line("当前权限：%s" % ("管理员" if self._elevated
+                                      else "普通用户（执行功能前会提醒提权）"),
+                       "info" if self._elevated else "warn")
         self._restore_or_autolocate()
 
     # ═══════════════════════════════════════════════════════════════
@@ -609,6 +643,22 @@ class ChaosZeroToolkit(ctk.CTk):
             text_color=COLOR_TEXT_DIM
         ).pack(side="left", padx=(0, 10), pady=15)
 
+        # 提权状态常驻标题栏：未提权时芯片即按钮，点击直接申请管理员
+        if is_windows_admin():
+            ctk.CTkLabel(
+                bar, text="✓ 管理员运行",
+                font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+                text_color=COLOR_SUCCESS
+            ).pack(side="right", padx=(4, 20), pady=15)
+        else:
+            ctk.CTkButton(
+                bar, text="未以管理员运行 · 点击提权", width=210, height=30,
+                corner_radius=8, fg_color=COLOR_WARN_DEEP, hover_color=COLOR_WARN_HOVER,
+                text_color="#FFFFFF", border_width=1, border_color="#7C2D12",
+                font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+                command=self._elevate_restart
+            ).pack(side="right", padx=(4, 20), pady=15)
+
         qq_btn = ctk.CTkButton(
             bar, text="QQ群", width=72, height=30, corner_radius=8,
             fg_color="transparent", hover_color=COLOR_BG_CARD,
@@ -616,7 +666,7 @@ class ChaosZeroToolkit(ctk.CTk):
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
             command=lambda: self._copy_to_clipboard("777529227")
         )
-        qq_btn.pack(side="right", padx=(4, 20), pady=15)
+        qq_btn.pack(side="right", padx=4, pady=15)
 
         github_btn = ctk.CTkButton(
             bar, text="GitHub", width=86, height=30, corner_radius=8,
@@ -932,6 +982,93 @@ class ChaosZeroToolkit(ctk.CTk):
         self._log_line("正在停止...", "warn")
 
     # ═══════════════════════════════════════════════════════════════
+    # 管理员权限：检测在启动时完成（_elevated）；未提权时所有写入类
+    # 功能执行前走一次醒目提醒，可当场一键提权重启
+    # ═══════════════════════════════════════════════════════════════
+    def _ensure_admin_or_confirm(self, action):
+        """未提权时执行功能前的醒目提醒。
+        返回 True 表示本次继续；False 表示取消（或已发起提权重启，本实例随即退出）。"""
+        if self._elevated:
+            return True
+        box = ctk.CTkToplevel(self, fg_color=COLOR_BG_CARD)
+        box.title("权限提醒")
+        box.geometry("560x360")
+        box.resizable(False, False)
+        box.transient(self)
+        choice = {"go": None}
+
+        def finish(value):
+            choice["go"] = value
+            box.destroy()
+
+        ctk.CTkLabel(box, text="⚠",
+                     font=ctk.CTkFont(size=46),
+                     text_color=COLOR_WARNING).pack(pady=(26, 2))
+        ctk.CTkLabel(box, text="建议以管理员身份运行",
+                     font=ctk.CTkFont(family=GLOBAL_FONT[0], size=19, weight="bold"),
+                     text_color=COLOR_TEXT).pack()
+        ctk.CTkLabel(
+            box,
+            text="即将执行：" + action + "\n\n"
+                 "当前未以管理员身份运行。写入游戏目录、替换 EXE\n"
+                 "或修改游戏资源时，可能因权限不足或文件占用而失败。\n"
+                 "推荐以管理员身份重启工具后再执行。",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
+            text_color=COLOR_TEXT_DIM, justify="center"
+        ).pack(pady=(10, 20), padx=30)
+
+        btns = ctk.CTkFrame(box, fg_color="transparent")
+        btns.pack(pady=(0, 22))
+        ctk.CTkButton(
+            btns, text="以管理员身份重启（推荐）", width=216, height=40, corner_radius=8,
+            fg_color=COLOR_WARN_DEEP, hover_color=COLOR_WARN_HOVER, text_color="#FFFFFF",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+            command=lambda: finish("elevate")
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btns, text="本次仍要继续", width=132, height=40, corner_radius=8,
+            fg_color="#313244", hover_color="#45475A", text_color=COLOR_TEXT,
+            border_width=1, border_color=COLOR_BORDER,
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
+            command=lambda: finish(True)
+        ).pack(side="left", padx=6)
+
+        box.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        box.grab_set()
+        box.after(120, box.lift)
+        box.wait_window()
+
+        if choice["go"] == "elevate":
+            self._elevate_restart()
+            return False
+        if choice["go"] is True:
+            self._log_line("未提权继续执行（用户确认）：" + action, "warn")
+            return True
+        self._log_line("已取消操作（未提权）：" + action, "warn")
+        return False
+
+    def _elevate_restart(self):
+        """以管理员身份重新启动本工具（触发 UAC），成功后退出当前实例。"""
+        try:
+            if getattr(sys, "frozen", False):
+                exe = sys.executable
+                params = subprocess.list2cmdline(sys.argv[1:])
+            else:
+                exe = sys.executable
+                params = subprocess.list2cmdline([os.path.abspath(sys.argv[0])] + list(sys.argv[1:]))
+            # lpDirectory 传工具目录：提权后实例的工作目录不变，配置与日志仍落在同一处
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, EXE_DIR, 1)
+        except Exception as exc:
+            self._log_line(f"提权重启失败: {exc}", "error")
+            return False
+        if int(rc & 0xFFFFFFFF) > 32:
+            self._log_line("已请求管理员授权，正在以管理员身份重启…（本窗口可关闭）", "ok")
+            self.after(400, self.destroy)
+            return True
+        self._log_line("未获得管理员授权（UAC 已取消或被策略阻止）", "warn")
+        return False
+
+    # ═══════════════════════════════════════════════════════════════
     # 自动寻找游戏目录
     # ═══════════════════════════════════════════════════════════════
     def _auto_find_game(self):
@@ -1225,6 +1362,8 @@ class ChaosZeroToolkit(ctk.CTk):
                 "游戏目录下没有 gameres/manifest.ssra。\n"
                 "请确认游戏已更新到 ssra 资源版本且路径正确。")
             return
+        if not self._ensure_admin_or_confirm("繁转简（ssra）"):
+            return
         if not messagebox.askyesno(
                 "繁转简（ssra）",
                 "将把官方繁中 text.db 转为简体并应用到游戏。\n\n"
@@ -1303,6 +1442,8 @@ class ChaosZeroToolkit(ctk.CTk):
             messagebox.showwarning(
                 "未找到游戏 EXE",
                 "游戏目录下没有 " + GAME_EXE_NAME + "。\n请先在「游戏目录」中确认路径。")
+            return
+        if not self._ensure_admin_or_confirm("生成加速 EXE"):
             return
         self.is_running = True
         self._stop_requested = False
