@@ -16,16 +16,15 @@ if %errorlevel% neq 0 (
     echo.
 )
 
-echo [1/3] Cleaning old build...
+echo [1/2] Cleaning old build...
 if exist "dist" rmdir /s /q "dist"
 if exist "build" rmdir /s /q "build"
 if exist "ChaosZero-Toolkit.spec" del /q "ChaosZero-Toolkit.spec"
 echo      Done.
 echo.
 
-echo [2/3] Building exe with PyInstaller...
+echo [2/2] Building exe with PyInstaller...
 pyinstaller --onefile --noconsole --name ChaosZero-Toolkit ^
-  --add-data "rebuild_ko_to_zht.py;." ^
   --add-data "rebuild_bundle.py;." ^
   --add-data "unpack_data.py;." ^
   --add-data "embedded_bundle_patcher.py;." ^
@@ -64,14 +63,9 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo [3/3] Copying TSV files to dist...
-copy "text_ko_text.tsv" "dist\text_ko_text.tsv" >nul 2>&1
-
-echo.
 echo ============================================
 echo   Build OK!
 echo   Output: dist\ChaosZero-Toolkit.exe
-echo           dist\text_ko_text.tsv
 echo ============================================
 
 explorer "dist"

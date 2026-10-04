@@ -15,17 +15,15 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-ChaosZero Toolkit — 卡俄斯：噩梦 汉化工具
-现代化 GUI 界面，基于 CustomTkinter
+ChaosZero Toolkit — 卡厄斯梦境 汉化 · 变速工具
+现代卡片式 GUI（CustomTkinter）。功能：ssra 繁转简 / 加速 EXE 生成 / 游戏目录定位。
 """
 import customtkinter as ctk
-import tkinter as tk
 from tkinter import filedialog, messagebox
 import os
 import sys
 import threading
 import time
-import struct
 import string
 import hashlib
 import traceback
@@ -33,6 +31,7 @@ import glob
 import json
 import stat
 import ctypes
+import subprocess
 
 # ═══════════════════════════════════════════════════════════════════════
 # 主题配置
@@ -48,6 +47,8 @@ COLOR_ACCENT_HOVER = "#2563EB"       # 强调色悬停
 COLOR_HIGHLIGHT    = "#EF4444"       # 高亮/危险操作 (红)
 COLOR_SUCCESS      = "#10B981"       # 成功 (绿)
 COLOR_WARNING      = "#F59E0B"       # 警告 (橙/黄)
+COLOR_WARN_DEEP    = "#B45309"       # 警告按钮底色 (深琥珀，白字可读)
+COLOR_WARN_HOVER   = "#92400E"       # 警告按钮悬停
 COLOR_TEXT         = "#F8FAFC"       # 主标题/文本 (亮白)
 COLOR_TEXT_DIM     = "#94A3B8"       # 次要说明文本 (灰白)
 COLOR_BORDER       = "#383854"       # 分隔线/边框
@@ -69,7 +70,7 @@ SGUP_APPS_SUB   = r"SOFTWARE\SGUP\apps"
 SGUP_ACTIVE_SUB = r"SOFTWARE\SGUP\activeProcess"
 UNINSTALL_SUB   = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
 STOVE_MANIFEST_SUB = os.path.join("STOVE", "GameManifest")
-COMBINED_MANIFEST_SUB = os.path.join("bin", "appdata", "cznlive")  # = _detect_game_files 里的 pack_dir
+COMBINED_MANIFEST_SUB = os.path.join("bin", "appdata", "cznlive")  # 数据分卷所在目录（多副本打分用）
 # 扫盘预算：默认 5 层足够覆盖盘符下「任意父目录\游戏名」；勾选深度搜索放到 8
 BFS_MAX_LEVELS  = 5
 BFS_DEEP_LEVELS = 8
@@ -82,7 +83,7 @@ COPY_HINT_TOKENS = ("desktop", "downloads", "onedrive", "appdata", "sandbox",
                     "副本", "备份", "copy", "-old", "_old", "backup", "\\bak")
 SETTINGS_NAME = "toolkit_settings.json"
 
-APP_VERSION = "2.0.4fix"
+APP_VERSION = "2.0.4fix2"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包后，exe 实际运行目录（而非临时解压目录）
@@ -92,24 +93,73 @@ if "__compiled__" in dir() or hasattr(sys, 'frozen'):
 else:
     EXE_DIR = SCRIPT_DIR
 
-# 兄弟模块（embedded_bundle_patcher / rebuild_ko_to_zht 等）是按目录名导入的，
+# 兄弟模块（embedded_bundle_patcher / ssra_zhcn 等）是按目录名导入的，
 # 启动期的目录检测就会用到，这里先把本目录挂上，免得依赖运行时的 import 顺序。
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 
-class LogRedirector:
-    """Redirect print() output to the GUI log widget."""
-    def __init__(self, callback):
-        self.callback = callback
-        self.buffer = ""
+def enable_windows_dpi_awareness():
+    """高分屏清晰渲染：进程级 DPI 感知须在首个窗口创建前声明，shcore 失败退 user32。"""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
-    def write(self, text):
-        if text:
-            self.callback(text)
 
-    def flush(self):
+def is_windows_admin():
+    """当前进程是否以管理员令牌运行（Win10/Win11 通用，非 Windows 视为已提权）。"""
+    if os.name != "nt":
+        return True
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return True
+    except Exception:
         pass
+    try:
+        token = ctypes.c_void_p()
+        if not ctypes.windll.advapi32.OpenProcessToken(
+                ctypes.windll.kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            return False
+        try:
+            elev = ctypes.c_ulong()
+            ret = ctypes.c_ulong()
+            # 20 = TOKEN_ELEVATION：非零即提权令牌
+            ok = ctypes.windll.advapi32.GetTokenInformation(
+                token, 20, ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(ret))
+            return bool(ok and elev.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(token)
+    except Exception:
+        return False
+
+
+def is_uac_disabled():
+    """EnableLUA=0 时系统没有提权 broker，runas 必然静默失败（只能换管理员账户或重开 UAC）。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                            0, winreg.KEY_READ) as key:
+            value, _type = winreg.QueryValueEx(key, "EnableLUA")
+            return int(value) == 0
+    except OSError:
+        return False
+
+
+# ShellExecuteExW 失败时的常见 Win32 错误 → 用户能看懂的提示
+ELEV_ERR_HINTS = {
+    1223: "UAC 弹窗被取消（点了「否」，或系统策略自动拒绝标准用户的提权请求）",
+    5: "访问被拒绝（提权请求被安全软件或组策略拦截）",
+    1260: "组策略禁止在此计算机上提权",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -554,123 +604,115 @@ class ChaosZeroToolkit(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("ChaosZero Toolkit — 卡俄斯：噩梦 汉化工具")
-        self.geometry("900x720")
-        self.minsize(800, 600)
+        self.title("ChaosZero Toolkit — 卡厄斯梦境 汉化 · 变速工具")
+        self.geometry("960x740")
+        self.minsize(860, 620)
         self.configure(fg_color=COLOR_BG)
 
         # State
         self.game_bin_path = ctk.StringVar(value="")
-        self.pack_dir = ""
         self.gameres_dir = ""
-        self.has_zht = False
-        self.tsv_path = None
         self.is_running = False
+        self._stop_requested = False
         self._locate_cancel = threading.Event()
         self._locating = False
         self._path_applied = ""
+        self._speed_source_sha256 = ""
+        self._speed_source_was_patched = False
+        self._can_ssra = False
+        self._can_speed = False
+        self._log_buf = []
+        self._log_flush_scheduled = False
 
         self._build_ui()
+        self._elevated = is_windows_admin()
+        self._log_line("当前权限：%s" % ("管理员" if self._elevated
+                                      else "普通用户（执行功能前会提醒提权）"),
+                       "info" if self._elevated else "warn")
         self._restore_or_autolocate()
 
     # ═══════════════════════════════════════════════════════════════
     # UI 构建
     # ═══════════════════════════════════════════════════════════════
     def _build_ui(self):
-        # ── 顶部标题栏 ──
-        title_frame = ctk.CTkFrame(self, fg_color=COLOR_TITLE_BG, corner_radius=0, height=65)
-        title_frame.pack(fill="x", padx=0, pady=0)
-        title_frame.pack_propagate(False)
+        self._build_header()
 
-        title_label = ctk.CTkLabel(
-            title_frame,
-            text="⚔ ChaosZero Toolkit",
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=22, weight="bold"),
+        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        self._build_path_section(main_frame)
+        self._build_status_section(main_frame)
+        self._build_action_section(main_frame)
+        self._build_progress_section(main_frame)
+        self._build_log_section(main_frame)
+
+    def _build_header(self):
+        bar = ctk.CTkFrame(self, fg_color=COLOR_TITLE_BG, corner_radius=0, height=64)
+        bar.pack(fill="x", padx=0, pady=0)
+        bar.pack_propagate(False)
+
+        ctk.CTkLabel(
+            bar, text="ChaosZero Toolkit",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=21, weight="bold"),
             text_color="#FFFFFF"
-        )
-        title_label.pack(side="left", padx=20, pady=15)
-
-        version_label = ctk.CTkLabel(
-            title_frame,
-            text="v" + APP_VERSION,
+        ).pack(side="left", padx=20, pady=15)
+        ctk.CTkLabel(
+            bar, text="v" + APP_VERSION,
             font=ctk.CTkFont(family="Consolas", size=12),
             text_color=COLOR_TEXT_DIM
-        )
-        version_label.pack(side="right", padx=(8, 20), pady=15)
+        ).pack(side="left", padx=(0, 10), pady=15)
+
+        # 未提权时芯片即提权按钮
+        if is_windows_admin():
+            ctk.CTkLabel(
+                bar, text="✓ 管理员运行",
+                font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+                text_color=COLOR_SUCCESS
+            ).pack(side="right", padx=(4, 20), pady=15)
+        else:
+            ctk.CTkButton(
+                bar, text="未以管理员运行 · 点击提权", width=210, height=30,
+                corner_radius=8, fg_color=COLOR_WARN_DEEP, hover_color=COLOR_WARN_HOVER,
+                text_color="#FFFFFF", border_width=1, border_color="#7C2D12",
+                font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+                command=self._elevate_restart
+            ).pack(side="right", padx=(4, 20), pady=15)
 
         qq_btn = ctk.CTkButton(
-            title_frame,
-            text="💬 QQ群",
-            width=82,
-            height=30,
-            corner_radius=8,
-            fg_color="transparent",
-            hover_color=COLOR_BG_CARD,
-            text_color="#FFFFFF",
-            border_width=1,
-            border_color=COLOR_BORDER,
+            bar, text="QQ群", width=72, height=30, corner_radius=8,
+            fg_color="transparent", hover_color=COLOR_BG_CARD,
+            text_color="#FFFFFF", border_width=1, border_color=COLOR_BORDER,
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
             command=lambda: self._copy_to_clipboard("777529227")
         )
         qq_btn.pack(side="right", padx=4, pady=15)
 
         github_btn = ctk.CTkButton(
-            title_frame,
-            text="⭐ GitHub",
-            width=92,
-            height=30,
-            corner_radius=8,
-            fg_color="transparent",
-            hover_color=COLOR_BG_CARD,
-            text_color="#FFFFFF",
-            border_width=1,
-            border_color=COLOR_BORDER,
+            bar, text="GitHub", width=86, height=30, corner_radius=8,
+            fg_color="transparent", hover_color=COLOR_BG_CARD,
+            text_color="#FFFFFF", border_width=1, border_color=COLOR_BORDER,
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
-            command=lambda: self._open_url("https://github.com/NineS11942/ChaosZeroYuna-Engine-Unpacker-Simplified-Chinese-Localization-Patch")
+            command=lambda: self._open_url("https://github.com/yporoc/ChaosZeroNightmare-Toolkit-Extra")
         )
         github_btn.pack(side="right", padx=4, pady=15)
-
-        # ── 主内容区 ──
-        main_frame = ctk.CTkFrame(self, fg_color="transparent")
-        main_frame.pack(fill="both", expand=True, padx=20, pady=10)
-
-        # Step 1: 选择游戏路径
-        self._build_path_section(main_frame)
-
-        # Step 2: 状态面板
-        self._build_status_section(main_frame)
-
-        # Step 3: 操作按钮
-        self._build_action_section(main_frame)
-
-        # Step 4: 进度条
-        self._build_progress_section(main_frame)
-
-        # Step 5: 日志区域
-        self._build_log_section(main_frame)
 
     def _build_path_section(self, parent):
         frame = ctk.CTkFrame(parent, fg_color=COLOR_BG_CARD, corner_radius=10,
                              border_width=1, border_color=COLOR_BORDER)
         frame.pack(fill="x", pady=(0, 8))
 
-        header = ctk.CTkLabel(
-            frame,
-            text=" 📁 第一步：选择游戏目录",
+        ctk.CTkLabel(
+            frame, text=" ① 游戏目录",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=15, weight="bold"),
-            text_color=COLOR_TEXT,
-            anchor="w"
-        )
-        header.pack(fill="x", padx=15, pady=(12, 2))
+            text_color=COLOR_TEXT, anchor="w"
+        ).pack(fill="x", padx=15, pady=(12, 2))
 
-        hint = ctk.CTkLabel(
+        ctk.CTkLabel(
             frame,
             text="选择 ChaosZeroNightmare 文件夹（或直接输入路径后回车）；「自动寻找」先查官方安装记录与常见安装层，必要时才扫盘",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
-            text_color=COLOR_TEXT_DIM,
-            anchor="w"
-        )
-        hint.pack(fill="x", padx=18, pady=(0, 8))
+            text_color=COLOR_TEXT_DIM, anchor="w"
+        ).pack(fill="x", padx=18, pady=(0, 8))
 
         row = ctk.CTkFrame(frame, fg_color="transparent")
         row.pack(fill="x", padx=15, pady=(0, 15))
@@ -692,13 +734,8 @@ class ChaosZeroToolkit(ctk.CTk):
             self.path_entry.bind(seq, self._on_path_typed)
 
         self.auto_find_btn = ctk.CTkButton(
-            row,
-            text="🔍 自动寻找",
-            width=100,
-            height=36,
-            corner_radius=6,
-            fg_color=COLOR_SUCCESS,
-            hover_color="#059669", # 更深的绿
+            row, text="自动寻找", width=100, height=36, corner_radius=6,
+            fg_color=COLOR_SUCCESS, hover_color="#059669",
             text_color="#FFFFFF",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
             command=self._auto_find_game
@@ -706,13 +743,8 @@ class ChaosZeroToolkit(ctk.CTk):
         self.auto_find_btn.pack(side="right", padx=(0, 8))
 
         browse_btn = ctk.CTkButton(
-            row,
-            text="📂 浏览",
-            width=80,
-            height=36,
-            corner_radius=6,
-            fg_color=COLOR_ACCENT,
-            hover_color=COLOR_ACCENT_HOVER,
+            row, text="浏览", width=80, height=36, corner_radius=6,
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
             text_color="#FFFFFF",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
             command=self._browse_game_dir
@@ -721,17 +753,10 @@ class ChaosZeroToolkit(ctk.CTk):
 
         self.deep_scan_var = ctk.BooleanVar(value=False)
         self.deep_scan_cb = ctk.CTkCheckBox(
-            row,
-            text="深度搜索",
-            variable=self.deep_scan_var,
-            width=100,
-            height=36,
-            checkbox_width=16,
-            checkbox_height=16,
-            corner_radius=4,
-            fg_color=COLOR_BG_CARD,
-            border_color=COLOR_BORDER,
-            border_width=1,
+            row, text="深度搜索", variable=self.deep_scan_var,
+            width=100, height=36,
+            checkbox_width=16, checkbox_height=16, corner_radius=4,
+            fg_color=COLOR_BG_CARD, border_color=COLOR_BORDER, border_width=1,
             text_color=COLOR_TEXT_DIM,
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
             command=self._toggle_deep_tip
@@ -746,142 +771,87 @@ class ChaosZeroToolkit(ctk.CTk):
                              border_width=1, border_color=COLOR_BORDER)
         frame.pack(fill="x", pady=(0, 8))
 
-        header = ctk.CTkLabel(
-            frame,
-            text=" 📊 状态检测",
+        ctk.CTkLabel(
+            frame, text=" ② 就绪检测",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=15, weight="bold"),
-            text_color=COLOR_TEXT,
-            anchor="w"
-        )
-        header.pack(fill="x", padx=15, pady=(12, 4))
+            text_color=COLOR_TEXT, anchor="w"
+        ).pack(fill="x", padx=15, pady=(12, 4))
 
-        # 状态网格
         grid = ctk.CTkFrame(frame, fg_color="transparent")
         grid.pack(fill="x", padx=15, pady=(0, 15))
         grid.columnconfigure((0, 1, 2, 3), weight=1)
 
-        # 4 个状态指示器
         self.status_labels = {}
         indicators = [
-            ("exe", "游戏启动器", "⏳ 等待选择"),
-            ("manifest", "manifest.ssra", "⏳ 等待检测"),
-            ("part", "lang_zht_b03_0.ssrc", "⏳ 等待检测"),
-            ("etag", "manifest.ssra.etag", "⏳ 等待检测"),
+            ("exe", "游戏启动器 EXE", "等待检测"),
+            ("manifest", "manifest.ssra", "等待检测"),
+            ("part", "lang_zht_b03_0.ssrc", "等待检测"),
+            ("etag", "manifest.ssra.etag", "等待检测"),
         ]
         for col, (key, title, default) in enumerate(indicators):
             card = ctk.CTkFrame(grid, fg_color="#313244", corner_radius=6,
                                 border_width=1, border_color="#45475A")
-            card.grid(row=0, column=col, padx=5, pady=2, sticky="nsew")
+            card.grid(row=0, column=col, padx=4, pady=2, sticky="nsew")
 
-            t = ctk.CTkLabel(card, text=title, font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
-                             text_color=COLOR_TEXT_DIM)
-            t.pack(pady=(10, 2))
-
-            v = ctk.CTkLabel(card, text=default, font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
-                             text_color=COLOR_TEXT)
-            v.pack(pady=(0, 10))
-            self.status_labels[key] = v
+            ctk.CTkLabel(card, text=title,
+                         font=ctk.CTkFont(family=GLOBAL_FONT[0], size=11),
+                         text_color=COLOR_TEXT_DIM).pack(pady=(10, 2))
+            value = ctk.CTkLabel(card, text=default,
+                                 font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12, weight="bold"),
+                                 text_color=COLOR_TEXT)
+            value.pack(pady=(0, 10))
+            self.status_labels[key] = value
 
     def _build_action_section(self, parent):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.pack(fill="x", pady=(0, 8))
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap.pack(fill="x", pady=(0, 8))
+        wrap.columnconfigure((0, 1), weight=1, uniform="action")
 
-        options_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        options_frame.pack(side="top", fill="x", pady=(0, 10))
-
-        left_options = ctk.CTkFrame(options_frame, fg_color="transparent")
-        left_options.pack(side="left", fill="y")
-
-        right_options = ctk.CTkFrame(options_frame, fg_color="transparent")
-        right_options.pack(side="right", fill="y")
-
-        self.use_simplified_var = ctk.BooleanVar(value=False)
-        self.use_simplified_cb = ctk.CTkCheckBox(
-            left_options,
-            text="纯繁转简",
-            variable=self.use_simplified_var,
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
-            text_color=COLOR_TEXT
-        )
-        self.use_simplified_cb.pack(side="left", anchor="w", padx=(2, 5))
-
-        self.use_local_zht_var = ctk.BooleanVar(value=False)
-        self.use_local_zht_cb = ctk.CTkCheckBox(
-            left_options,
-            text="用本地 (用本地的tsv文件构建 一般无特殊用途不用勾选)",
-            variable=self.use_local_zht_var,
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
-            text_color=COLOR_TEXT
-        )
-        self.use_local_zht_cb.pack(side="left", anchor="w", padx=(2, 10))
-
-        self.apply_translation_var = ctk.BooleanVar(value=False)
-        self.apply_translation_cb = ctk.CTkCheckBox(
-            right_options,
-            text="汉化",
-            variable=self.apply_translation_var,
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
-            text_color=COLOR_TEXT
-        )
-        self.apply_translation_cb.pack(side="left", anchor="w", padx=(10, 5))
-
-        self.inject_init_js_var = ctk.BooleanVar(value=False)
-        self.inject_init_js_cb = ctk.CTkCheckBox(
-            right_options,
-            text="注入加速（自动适配游戏更新）",
-            variable=self.inject_init_js_var,
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
-            text_color=COLOR_TEXT
-        )
-        self.inject_init_js_cb.pack(side="left", anchor="w", padx=(5, 0))
-
-        self.start_btn = ctk.CTkButton(
-            frame,
-            text="🚀 构建封包",
-            height=44,
-            corner_radius=8,
-            fg_color=COLOR_ACCENT,
-            hover_color=COLOR_ACCENT_HOVER,
-            text_color="#FFFFFF",
-            text_color_disabled="#FFFFFF",
+        zh_card = ctk.CTkFrame(wrap, fg_color=COLOR_BG_CARD, corner_radius=10,
+                               border_width=1, border_color=COLOR_BORDER)
+        zh_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        ctk.CTkLabel(
+            zh_card, text="繁转简 · ssra",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=15, weight="bold"),
-            command=self._start_translation,
-            state="disabled"
-        )
-        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
-
-        self.stop_btn = ctk.CTkButton(
-            frame,
-            text="⏹ 停止",
-            height=44,
-            width=100,
-            corner_radius=8,
-            fg_color="#313244",
-            hover_color="#45475A",
-            text_color="#F8FAFC",
-            border_width=1,
-            border_color=COLOR_BORDER,
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=14, weight="bold"),
-            command=self._stop_translation,
-            state="disabled"
-        )
-        self.stop_btn.pack(side="right", padx=(0, 0))
-
+            text_color=COLOR_TEXT, anchor="w"
+        ).pack(fill="x", padx=15, pady=(12, 2))
+        ctk.CTkLabel(
+            zh_card,
+            text="提取官方繁中文本转简体并应用到游戏；原文件自动备份，可随时还原。应用后 patching 不再要求重新下载。",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
+            text_color=COLOR_TEXT_DIM, anchor="w", justify="left", wraplength=390
+        ).pack(fill="x", padx=18, pady=(0, 12))
         self.ssra_btn = ctk.CTkButton(
-            frame,
-            text="繁转简 (ssra)",
-            height=44,
-            width=150,
-            corner_radius=8,
-            fg_color="#313244",
-            hover_color="#45475A",
-            text_color="#F8FAFC",
-            border_width=1,
-            border_color=COLOR_BORDER,
+            zh_card, text="开始繁转简", height=40, corner_radius=8,
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+            text_color="#FFFFFF", text_color_disabled="#FFFFFF",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=14, weight="bold"),
-            command=self._start_ssra_zhcn
+            command=self._start_ssra_zhcn, state="disabled"
         )
-        self.ssra_btn.pack(side="right", padx=(8, 8))
+        self.ssra_btn.pack(fill="x", padx=15, pady=(0, 15))
+
+        sp_card = ctk.CTkFrame(wrap, fg_color=COLOR_BG_CARD, corner_radius=10,
+                               border_width=1, border_color=COLOR_BORDER)
+        sp_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        ctk.CTkLabel(
+            sp_card, text="加速 EXE",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=15, weight="bold"),
+            text_color=COLOR_TEXT, anchor="w"
+        ).pack(fill="x", padx=15, pady=(12, 2))
+        ctk.CTkLabel(
+            sp_card,
+            text="补丁游戏 EXE 注入变速/热键脚本（自动适配游戏更新），产物输出到 output 目录，可选择自动替换（原文件备份为 .bak）。",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
+            text_color=COLOR_TEXT_DIM, anchor="w", justify="left", wraplength=390
+        ).pack(fill="x", padx=18, pady=(0, 12))
+        self.speed_btn = ctk.CTkButton(
+            sp_card, text="生成加速 EXE", height=40, corner_radius=8,
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+            text_color="#FFFFFF", text_color_disabled="#FFFFFF",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=14, weight="bold"),
+            command=self._start_speed_exe, state="disabled"
+        )
+        self.speed_btn.pack(fill="x", padx=15, pady=(0, 15))
 
     def _build_progress_section(self, parent):
         frame = ctk.CTkFrame(parent, fg_color=COLOR_BG_CARD, corner_radius=10,
@@ -892,29 +862,31 @@ class ChaosZeroToolkit(ctk.CTk):
         row.pack(fill="x", padx=15, pady=(10, 2))
 
         self.progress_label = ctk.CTkLabel(
-            row,
-            text="进度：等待操作",
+            row, text="进度：等待操作",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
-            text_color=COLOR_TEXT,
-            anchor="w"
+            text_color=COLOR_TEXT, anchor="w"
         )
         self.progress_label.pack(side="left")
 
-        self.progress_pct = ctk.CTkLabel(
-            row,
-            text="0%",
-            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
-            text_color=COLOR_SUCCESS,
-            anchor="e"
+        self.stop_btn = ctk.CTkButton(
+            row, text="停止", width=84, height=26, corner_radius=6,
+            fg_color="#313244", hover_color="#45475A",
+            text_color=COLOR_TEXT, border_width=1, border_color=COLOR_BORDER,
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12, weight="bold"),
+            command=self._request_stop, state="disabled"
         )
-        self.progress_pct.pack(side="right")
+        self.stop_btn.pack(side="right")
+
+        self.progress_pct = ctk.CTkLabel(
+            row, text="0%",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+            text_color=COLOR_SUCCESS, anchor="e"
+        )
+        self.progress_pct.pack(side="right", padx=(0, 10))
 
         self.progress_bar = ctk.CTkProgressBar(
-            frame,
-            height=10,
-            corner_radius=5,
-            fg_color="#313244",
-            progress_color=COLOR_SUCCESS
+            frame, height=10, corner_radius=5,
+            fg_color="#313244", progress_color=COLOR_SUCCESS
         )
         self.progress_bar.pack(fill="x", padx=15, pady=(2, 12))
         self.progress_bar.set(0)
@@ -928,22 +900,14 @@ class ChaosZeroToolkit(ctk.CTk):
         header_row.pack(fill="x", padx=15, pady=(8, 4))
 
         ctk.CTkLabel(
-            header_row,
-            text=" 📋 运行日志",
+            header_row, text=" 运行日志",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=14, weight="bold"),
-            text_color=COLOR_TEXT,
-            anchor="w"
+            text_color=COLOR_TEXT, anchor="w"
         ).pack(side="left")
 
         clear_btn = ctk.CTkButton(
-            header_row,
-            text="清空",
-            width=50,
-            height=26,
-            corner_radius=4,
-            fg_color="#313244",
-            text_color="#F8FAFC",
-            hover_color="#45475A",
+            header_row, text="清空", width=50, height=26, corner_radius=4,
+            fg_color="#313244", text_color=COLOR_TEXT, hover_color="#45475A",
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=12),
             command=self._clear_log
         )
@@ -953,7 +917,7 @@ class ChaosZeroToolkit(ctk.CTk):
             frame,
             font=ctk.CTkFont(family="Consolas", size=13),
             fg_color=COLOR_LOG_BG,
-            text_color="#A6ACCD",  # 稍微偏蓝的柔和代码颜色
+            text_color="#A6ACCD",
             corner_radius=6,
             border_width=1,
             border_color="#181825",
@@ -965,18 +929,31 @@ class ChaosZeroToolkit(ctk.CTk):
     # ═══════════════════════════════════════════════════════════════
     # 日志工具
     # ═══════════════════════════════════════════════════════════════
-    def _log(self, text, tag=None):
-        """Thread-safe log append."""
-        def _append():
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", text)
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-        self.after(0, _append)
+    def _log(self, text):
+        """线程安全日志：先入缓冲合帧写入，长任务逐行 insert 会刷爆 UI 线程。"""
+        self._log_buf.append(text)
+        if not self._log_flush_scheduled:
+            self._log_flush_scheduled = True
+            self.after(120, self._flush_log)
+
+    def _flush_log(self):
+        self._log_flush_scheduled = False
+        if not self._log_buf:
+            return
+        chunk = "".join(self._log_buf)
+        self._log_buf.clear()
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", chunk)
+        # 行数上限：超限裁头部，防内存与渲染膨胀
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 6000:
+            self.log_text.delete("1.0", "%d.0" % (lines - 5000))
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
     def _log_line(self, msg, level="info"):
         ts = time.strftime("%H:%M:%S")
-        prefix = {"info": "ℹ", "ok": "✅", "warn": "⚠", "error": "❌", "step": "▶"}.get(level, "●")
+        prefix = {"info": "·", "ok": "✓", "warn": "⚠", "error": "✗", "step": "▶"}.get(level, "·")
         self._log(f"[{ts}] {prefix}  {msg}\n")
 
     def _clear_log(self):
@@ -1017,6 +994,133 @@ class ChaosZeroToolkit(ctk.CTk):
                     label.configure(text_color=COLOR_TEXT)
         self.after(0, _update)
 
+    def _request_stop(self):
+        self._stop_requested = True
+        self._log_line("正在停止...", "warn")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 管理员权限：未提权时功能执行前醒目提醒，可当场一键提权重启
+    # ═══════════════════════════════════════════════════════════════
+    def _ensure_admin_or_confirm(self, action):
+        """未提权时执行功能前的醒目提醒。返回 False 表示取消或已转提权重启。"""
+        if self._elevated:
+            return True
+        box = ctk.CTkToplevel(self, fg_color=COLOR_BG_CARD)
+        box.title("权限提醒")
+        box.geometry("560x360")
+        box.resizable(False, False)
+        box.transient(self)
+        choice = {"go": None}
+
+        def finish(value):
+            choice["go"] = value
+            box.destroy()
+
+        ctk.CTkLabel(box, text="⚠",
+                     font=ctk.CTkFont(size=46),
+                     text_color=COLOR_WARNING).pack(pady=(26, 2))
+        ctk.CTkLabel(box, text="建议以管理员身份运行",
+                     font=ctk.CTkFont(family=GLOBAL_FONT[0], size=19, weight="bold"),
+                     text_color=COLOR_TEXT).pack()
+        ctk.CTkLabel(
+            box,
+            text="即将执行：" + action + "\n\n"
+                 "当前未以管理员身份运行。写入游戏目录、替换 EXE\n"
+                 "或修改游戏资源时，可能因权限不足或文件占用而失败。\n"
+                 "推荐以管理员身份重启工具后再执行。",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
+            text_color=COLOR_TEXT_DIM, justify="center"
+        ).pack(pady=(10, 20), padx=30)
+
+        btns = ctk.CTkFrame(box, fg_color="transparent")
+        btns.pack(pady=(0, 22))
+        ctk.CTkButton(
+            btns, text="以管理员身份重启（推荐）", width=216, height=40, corner_radius=8,
+            fg_color=COLOR_WARN_DEEP, hover_color=COLOR_WARN_HOVER, text_color="#FFFFFF",
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
+            command=lambda: finish("elevate")
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btns, text="本次仍要继续", width=132, height=40, corner_radius=8,
+            fg_color="#313244", hover_color="#45475A", text_color=COLOR_TEXT,
+            border_width=1, border_color=COLOR_BORDER,
+            font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13),
+            command=lambda: finish(True)
+        ).pack(side="left", padx=6)
+
+        box.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        box.grab_set()
+        box.after(120, box.lift)
+        box.wait_window()
+
+        if choice["go"] == "elevate":
+            self._elevate_restart()
+            return False
+        if choice["go"] is True:
+            self._log_line("未提权继续执行（用户确认）：" + action, "warn")
+            return True
+        self._log_line("已取消操作（未提权）：" + action, "warn")
+        return False
+
+    def _elevate_restart(self):
+        """以管理员身份重启本工具（触发 UAC），成功后退出当前实例；失败返回确切错误码。"""
+        if self.is_running:
+            self._log_line("任务进行中，请等完成或停止后再提权重启", "warn")
+            return False
+        if is_uac_disabled():
+            self._log_line("本机已关闭 UAC（EnableLUA=0），系统没有提权弹窗机制，无法在运行时申请管理员", "error")
+            self._log_line("请改用管理员账户运行本工具，或重新开启 UAC：控制面板 → 用户账户 → 更改用户账户控制设置（改后需重启生效）", "warn")
+            return False
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            exe = sys.executable
+            params = subprocess.list2cmdline([os.path.abspath(sys.argv[0])] + list(sys.argv[1:]))
+
+        class _ExecInfo(ctypes.Structure):
+            # SHELLEXECUTEINFOW，x64 下 112 字节
+            _fields_ = [
+                ("cbSize", ctypes.c_ulong), ("fMask", ctypes.c_ulong),
+                ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
+                ("lpFile", ctypes.c_wchar_p), ("lpParameters", ctypes.c_wchar_p),
+                ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+                ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
+                ("dwHotKey", ctypes.c_ulong), ("hIconOrMonitor", ctypes.c_void_p),
+                ("hProcess", ctypes.c_void_p),
+            ]
+
+        info = _ExecInfo()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = 0x40 | 0x100        # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+        info.lpVerb = "runas"            # 触发 UAC；已提权进程则静默通过
+        info.lpFile = exe
+        info.lpParameters = params or None
+        # lpDirectory 固定工具目录，提权后配置与日志落点不变
+        info.lpDirectory = EXE_DIR
+        info.nShow = 1                   # SW_SHOWNORMAL
+
+        self._log_line("正在请求管理员授权…（若弹出 UAC 请点「是」）", "info")
+        try:
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_ExecInfo)]
+            shell32.ShellExecuteExW.restype = ctypes.c_int
+            ok = shell32.ShellExecuteExW(ctypes.byref(info))
+        except Exception as exc:
+            self._log_line(f"提权重启失败: {exc}", "error")
+            return False
+        if ok:
+            if info.hProcess:
+                ctypes.windll.kernel32.CloseHandle(info.hProcess)
+            self._log_line("管理员授权已通过，正在以管理员身份重启…（本窗口即将关闭）", "ok")
+            self.after(400, self.destroy)
+            return True
+        err = ctypes.get_last_error()
+        hint = ELEV_ERR_HINTS.get(err) or ctypes.FormatError(err)
+        self._log_line(f"未获得管理员授权（Win32 错误 {err}）：{hint}", "warn")
+        return False
+
     # ═══════════════════════════════════════════════════════════════
     # 自动寻找游戏目录
     # ═══════════════════════════════════════════════════════════════
@@ -1029,7 +1133,7 @@ class ChaosZeroToolkit(ctk.CTk):
         deep = bool(self.deep_scan_var.get())
         self._locate_cancel.clear()
         self._locating = True
-        self.auto_find_btn.configure(text="⏹ 停止搜索", fg_color=COLOR_HIGHLIGHT,
+        self.auto_find_btn.configure(text="停止搜索", fg_color=COLOR_HIGHLIGHT,
                                      hover_color="#B91C1C")
         self._log_line("开始自动寻找游戏目录（%s）..." % ("深度搜索" if deep else "常规探测"), "step")
         threading.Thread(target=self._auto_find_worker,
@@ -1037,7 +1141,7 @@ class ChaosZeroToolkit(ctk.CTk):
 
     def _reset_auto_find_btn(self):
         self._locating = False
-        self.auto_find_btn.configure(state="normal", text="🔍 自动寻找",
+        self.auto_find_btn.configure(state="normal", text="自动寻找",
                                      fg_color=COLOR_SUCCESS, hover_color="#059669")
 
     def _toggle_deep_tip(self):
@@ -1243,22 +1347,18 @@ class ChaosZeroToolkit(ctk.CTk):
         exe_path = os.path.join(bin_path, GAME_EXE_NAME)
         exe_found = os.path.isfile(exe_path)
 
-        # 1.5 检查内嵌注入脚本（加速 EXE 生成的前提）
+        # 内嵌脚本随 EXE 自释放，不占检测区；仅作生成前置，缺失才提示
         embedded_js_dir, embedded_js_error = self._get_embedded_js_dir()
         speed_assets_found = bool(embedded_js_dir)
+        if not speed_assets_found:
+            self._log_line(f"内嵌注入脚本不可用: {embedded_js_error}", "warn")
 
         if exe_found:
-            self._set_status("exe", f"✅ {GAME_EXE_NAME}", True)
+            self._set_status("exe", f"✓ {GAME_EXE_NAME}", True)
             self._log_line(f"找到游戏 EXE: {GAME_EXE_NAME}", "ok")
         else:
-            self._set_status("exe", "❌ 未找到", False)
+            self._set_status("exe", "✗ 未找到", False)
             self._log_line(f"未找到 {GAME_EXE_NAME}，请确认路径正确", "warn")
-
-        if speed_assets_found:
-            self._log_line(f"内嵌注入脚本: {embedded_js_dir}（17 个 JS）", "ok")
-            self._log_line("加速 EXE 将基于当前游戏版本自动生成", "info")
-        else:
-            self._log_line(f"内嵌注入脚本不可用: {embedded_js_error}", "warn")
 
         # 2. 检查 ssra 资源（繁转简的三个目标文件）
         gameres = os.path.join(bin_path, "appdata", "cznlive", "gameres")
@@ -1275,70 +1375,30 @@ class ChaosZeroToolkit(ctk.CTk):
                 ssra_found += 1
                 sz = os.path.getsize(p)
                 size = "%.1f MB" % (sz / 1024**2) if sz >= 1024**2 else "%d B" % sz
-                self._set_status(key, f"✅ {size}", True)
+                self._set_status(key, f"✓ {size}", True)
                 self._log_line(f"找到 {title} ({size}): {p}", "ok")
             else:
-                self._set_status(key, "❌ 未找到", False)
+                self._set_status(key, "✗ 未找到", False)
                 self._log_line(f"未找到 {title}: {p}", "warn")
 
-        # 繁转简与加速生成任一可用即可
-        can_start_ssra = ssra_found == len(targets)
-        can_start_speed = exe_found and speed_assets_found
-        self.ssra_btn.configure(state="normal" if can_start_ssra else "disabled")
-        self.start_btn.configure(state="normal" if can_start_speed else "disabled")
+        # 繁转简与加速生成任一可用即可；能力位记下，任务结束后按位恢复按钮
+        self._can_ssra = ssra_found == len(targets)
+        self._can_speed = exe_found and speed_assets_found
+        self.ssra_btn.configure(state="normal" if self._can_ssra else "disabled")
+        self.speed_btn.configure(state="normal" if self._can_speed else "disabled")
 
-        if can_start_ssra and can_start_speed:
+        if self._can_ssra and self._can_speed:
             self._log_line("检测完成：繁转简与加速 EXE 均可用！", "ok")
-        elif can_start_ssra:
+        elif self._can_ssra:
             self._log_line("检测完成：可以进行繁转简！", "ok")
-        elif can_start_speed:
-            self._log_line("检测完成，可以基于当前游戏版本生成加速 EXE！", "ok")
+        elif self._can_speed:
+            self._log_line("检测完成，可以生成加速 EXE！", "ok")
         else:
             self._log_line("检测完成，部分条件不满足，请检查", "warn")
 
     # ═══════════════════════════════════════════════════════════════
-    # 汉化核心流程
+    # 繁转简（ssra）
     # ═══════════════════════════════════════════════════════════════
-    def _start_translation(self):
-        if self.is_running:
-            return
-
-        # ZHT 未下载的提示（仅在勾选了汉化时才弹出）
-        apply_translation = getattr(self, 'apply_translation_var', None) and self.apply_translation_var.get()
-        if apply_translation and not self.has_zht:
-            result = messagebox.askyesno(
-                "ZHT 语言包未检测到",
-                "检测到您尚未下载 ZHT（繁体中文）语言包。\n\n"
-                "是否自动切换为替换韩文（KO）版本？\n\n"
-                "• 选「是」→ 替换 KO text.db（韩文→中文）\n"
-                "• 选「否」→ 取消操作",
-                icon="warning"
-            )
-            if not result:
-                self._log_line("用户取消操作", "warn")
-                return
-            self.replace_mode = "ko"
-            self._log_line("模式：替换 KO (韩文) text.db → 中文", "step")
-        elif apply_translation:
-            self.replace_mode = "zht"
-            self._log_line("模式：替换 ZHT (繁中) text.db → 简体中文", "step")
-        else:
-            self.replace_mode = None
-
-        self.is_running = True
-        self._stop_requested = False
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self._set_progress(0, "正在启动...")
-
-        # 在后台线程运行
-        thread = threading.Thread(target=self._run_translation, daemon=True)
-        thread.start()
-
-    def _stop_translation(self):
-        self._stop_requested = True
-        self._log_line("正在停止...", "warn")
-
     def _start_ssra_zhcn(self):
         if self.is_running:
             return
@@ -1349,6 +1409,8 @@ class ChaosZeroToolkit(ctk.CTk):
                 "游戏目录下没有 gameres/manifest.ssra。\n"
                 "请确认游戏已更新到 ssra 资源版本且路径正确。")
             return
+        if not self._ensure_admin_or_confirm("繁转简（ssra）"):
+            return
         if not messagebox.askyesno(
                 "繁转简（ssra）",
                 "将把官方繁中 text.db 转为简体并应用到游戏。\n\n"
@@ -1358,7 +1420,7 @@ class ChaosZeroToolkit(ctk.CTk):
             return
         self.is_running = True
         self._stop_requested = False
-        self.start_btn.configure(state="disabled")
+        self.speed_btn.configure(state="disabled")
         self.ssra_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._set_progress(0, "繁转简：开始...")
@@ -1398,7 +1460,6 @@ class ChaosZeroToolkit(ctk.CTk):
 
         except Exception as e:
             self._log_line(f"错误: {e}", "error")
-            import traceback
             self._log_line(traceback.format_exc())
             self._set_progress(0, "出错")
             self.after(0, lambda: messagebox.showerror("错误", f"繁转简失败:\n{e}"))
@@ -1406,262 +1467,152 @@ class ChaosZeroToolkit(ctk.CTk):
         finally:
             def _done():
                 self.is_running = False
-                self.start_btn.configure(state="normal")
-                self.ssra_btn.configure(state="normal")
+                self.ssra_btn.configure(state="normal" if self._can_ssra else "disabled")
+                self.speed_btn.configure(state="normal" if self._can_speed else "disabled")
                 self.stop_btn.configure(state="disabled")
             self.after(0, _done)
 
-    def _run_translation(self):
-        """后台线程：执行解包→翻译/注入→重新打包。"""
+    # ═══════════════════════════════════════════════════════════════
+    # 加速 EXE 生成
+    # ═══════════════════════════════════════════════════════════════
+    def _start_speed_exe(self):
+        if self.is_running:
+            return
+        embedded_js_dir, embedded_js_error = self._get_embedded_js_dir()
+        if not embedded_js_dir:
+            messagebox.showwarning(
+                "内嵌脚本不可用",
+                "缺少完整的 17 个 embedded_javascript 脚本：\n" + str(embedded_js_error))
+            return
+        source_exe = os.path.join(self.game_bin_path.get().strip(), GAME_EXE_NAME)
+        if not os.path.isfile(source_exe):
+            messagebox.showwarning(
+                "未找到游戏 EXE",
+                "游戏目录下没有 " + GAME_EXE_NAME + "。\n请先在「游戏目录」中确认路径。")
+            return
+        if not self._ensure_admin_or_confirm("生成加速 EXE"):
+            return
+        self.is_running = True
+        self._stop_requested = False
+        self.ssra_btn.configure(state="disabled")
+        self.speed_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._set_progress(0, "加速 EXE：开始...")
+        threading.Thread(target=self._run_speed_exe, args=(embedded_js_dir, source_exe),
+                         daemon=True).start()
+
+    def _run_speed_exe(self, embedded_js_dir, source_exe):
         try:
             t0 = time.time()
             self._log_line("==================================================")
-            self._log_line("开始流程", "step")
+            self._log_line("开始生成加速 EXE", "step")
             self._log_line("==================================================")
 
-            import importlib
-            sys.path.insert(0, SCRIPT_DIR)
-            import rebuild_ko_to_zht as rebuild
-            importlib.reload(rebuild)
+            import embedded_bundle_patcher as patcher
 
-            output_dir = os.path.join(EXE_DIR, "bin_full_rebuild")
+            output_dir = os.path.join(EXE_DIR, "output")
             os.makedirs(output_dir, exist_ok=True)
+            output_exe = os.path.join(output_dir, GAME_EXE_NAME)
+            if os.path.isfile(output_exe):
+                os.remove(output_exe)
 
-            apply_translation = getattr(self, 'apply_translation_var', None) and self.apply_translation_var.get()
-            inject_init_js = getattr(self, 'inject_init_js_var', None) and self.inject_init_js_var.get()
+            if self._stop_requested:
+                raise InterruptedError()
+            self._set_progress(0.3, "定位内嵌资源并注入 JS...")
+            stats = patcher.patch_exe(
+                source_exe,
+                output_exe,
+                embedded_js_dir,
+                init_path=os.path.join(embedded_js_dir, "init.js"),
+                toolkit_dir=EXE_DIR,
+            )
+            self._set_progress(0.9, "校验输出...")
 
-            if not apply_translation and not inject_init_js:
-                self._log_line("未勾选任何操作，已完成。", "warn")
-                self._set_progress(1.0, "完成！")
-                return
+            resource_path = "/".join(str(part) for part in stats["resource_path"])
+            self._log_line(f"动态定位 PE 资源 {resource_path}: offset=0x{stats['resource_offset']:X}, size={stats['resource_size']:,}", "info")
+            self._log_line(f"已清空 {stats['cleared_jbin']} 个 init.jbin，注入 {stats['injected_js']} 个 JS，资源大小保持不变", "ok")
+            sz = os.path.getsize(output_exe) / 1024 / 1024
+            self._log_line(f"已生成加速 EXE: {output_exe} ({sz:.1f} MB)", "ok")
+            self._log_line(f"源 SHA256: {stats['source_sha256']}", "info")
+            self._log_line(f"新 SHA256: {stats['output_sha256']}", "info")
 
-            ok = True
-            replaced = 0
-            produced_files = []
-            self._speed_source_sha256 = ""
-            self._speed_source_was_patched = False
+            self._speed_source_sha256 = stats["source_sha256"]
+            self._speed_source_was_patched = stats["source_was_patched"]
 
-            # 清理上一次构建的旧输出
-            for filename in os.listdir(output_dir):
-                stale_path = os.path.join(output_dir, filename)
-                if not os.path.isfile(stale_path):
-                    continue
-                if filename.startswith("data.pack") or filename == GAME_EXE_NAME:
-                    os.remove(stale_path)
-
-            old_stdout = sys.stdout
-            sys.stdout = LogRedirector(lambda t: self._log(t))
-
-            # ==== 1. 汉化处理 ====
-            if apply_translation:
-                self._log_line(">>> 执行汉化: data.pack", "step")
-                rebuild.PACK_DIR = self.pack_dir
-                if getattr(self, 'use_simplified_var', None) and self.use_simplified_var.get():
-                    rebuild.T2S_MODE = True
-                    rebuild.LOCAL_ZHT_MODE = getattr(self, 'use_local_zht_var', None) and self.use_local_zht_var.get()
-                else:
-                    rebuild.T2S_MODE = False
-                    rebuild.LOCAL_ZHT_MODE = False
-                    rebuild.TSV_PATH = self.tsv_path
-
-                rebuild.OUTPUT_DIR = output_dir
-
-                if self._stop_requested: raise InterruptedError()
-                self._set_progress(0.1, "提取 data.pack...")
-                entries, orig_header, orig_ver5, hash_count = rebuild.extract_all_files(self.pack_dir)
-
-                if self._stop_requested: raise InterruptedError()
-                self._set_progress(0.3, "文本替换...")
-                if self.replace_mode == "ko":
-                    rebuild.ZHT_DB_KEY = rebuild.KO_DB_KEY
-
-                if getattr(rebuild, 'T2S_MODE', False):
-                    zht_tsv_path = os.path.join(SCRIPT_DIR, "text_zht_text(纯繁转简).tsv") if getattr(rebuild, 'LOCAL_ZHT_MODE', False) else None
-                    if getattr(rebuild, 'LOCAL_ZHT_MODE', False) and not os.path.exists(zht_tsv_path):
-                        for _cand in (
-                            os.path.join(EXE_DIR, "text_zht_text(纯繁转简).tsv"),
-                            os.path.join(os.path.dirname(SCRIPT_DIR), "text_zht_text(纯繁转简).tsv"),
-                        ):
-                            if os.path.exists(_cand):
-                                zht_tsv_path = _cand
-                                break
-                    replaced = rebuild.process_zht_to_zhs(entries, tsv_path=zht_tsv_path)
-                else:
-                    replaced = rebuild.process_ko_to_zht(entries, self.tsv_path)
-
-                if self._stop_requested: raise InterruptedError()
-                self._set_progress(0.5, "重建 data.pack...")
-                rebuild.rebuild_and_write(entries, orig_header, orig_ver5, hash_count, output_dir)
-                produced_files.extend(
-                    filename for filename in os.listdir(output_dir)
-                    if filename.startswith("data.pack")
-                    and os.path.isfile(os.path.join(output_dir, filename))
-                )
-
-                if self._stop_requested: raise InterruptedError()
-                self._set_progress(0.7, "验证 data.pack...")
-                if not rebuild.verify_pack(output_dir, entries):
-                    ok = False
-                    self._log_line("⚠ data.pack 验证发现问题", "warn")
-
-            # ==== 2. 生成加速 EXE（补丁游戏 EXE 内嵌 JS bundle）====
-            if inject_init_js and ok:
-                self._log_line(">>> 执行注入: 当前游戏 EXE 内嵌 bundle", "step")
-                self._set_progress(0.8, "定位内嵌资源并注入 JS...")
-                try:
-                    import embedded_bundle_patcher as patcher
-                    importlib.reload(patcher)
-
-                    embedded_js_dir, embedded_js_error = self._get_embedded_js_dir()
-                    if not embedded_js_dir:
-                        raise FileNotFoundError(embedded_js_error)
-
-                    source_exe = os.path.join(self.game_bin_path.get(), GAME_EXE_NAME)
-                    output_exe = os.path.join(output_dir, GAME_EXE_NAME)
-
-                    stats = patcher.patch_exe(
-                        source_exe,
-                        output_exe,
-                        embedded_js_dir,
-                        init_path=os.path.join(embedded_js_dir, "init.js"),
-                        toolkit_dir=EXE_DIR,
-                    )
-
-                    sz = os.path.getsize(output_exe) / 1024 / 1024
-                    resource_path = "/".join(str(part) for part in stats["resource_path"])
-                    self._log_line(f"动态定位 PE 资源 {resource_path}: offset=0x{stats['resource_offset']:X}, size={stats['resource_size']:,}", "info")
-                    self._log_line(f"已清空 {stats['cleared_jbin']} 个 init.jbin，注入 {stats['injected_js']} 个 JS，资源大小保持不变", "ok")
-                    self._log_line(f"已生成加速 EXE: {output_exe} ({sz:.1f} MB)", "ok")
-                    self._log_line(f"源 SHA256: {stats['source_sha256']}", "info")
-                    self._log_line(f"新 SHA256: {stats['output_sha256']}", "info")
-
-                    self._speed_source_sha256 = stats["source_sha256"]
-                    self._speed_source_was_patched = stats["source_was_patched"]
-                    produced_files.append(GAME_EXE_NAME)
-                except Exception as ex:
-                    self._log_line(f"❌ 加速 EXE 自动生成失败: {ex}", "error")
-                    ok = False
-
-            sys.stdout = old_stdout
-            elapsed = time.time() - t0
             self._set_progress(1.0, "完成！")
+            self._log_line("==================================================")
+            self._log_line(f"✅ 操作成功完成！耗时 {time.time() - t0:.1f} 秒", "ok")
+            self._log_line(f"   输出目录: {output_dir}", "ok")
+            self._log_line("==================================================")
 
-            if ok:
-                self._log_line("==================================================")
-                self._log_line(f"✅ 操作成功完成！耗时 {elapsed:.1f} 秒", "ok")
-                self._log_line(f"   输出目录: {output_dir}", "ok")
-                self._log_line("==================================================")
+            def _ask_replace():
+                result = messagebox.askyesno(
+                    "生成完成 ✅",
+                    "加速 EXE 已生成。\n\n是否自动替换到游戏目录？\n（原文件将备份为 .bak）")
+                if result:
+                    self._auto_replace_bin(output_dir)
+                else:
+                    self._log_line("已跳过自动替换，请手动复制文件", "info")
 
-                _output_dir = output_dir
-                _produced_files = tuple(dict.fromkeys(produced_files))
-
-                def _ask_replace():
-                    from tkinter import messagebox
-                    result = messagebox.askyesno(
-                        "操作完成 ✅",
-                        "打包成功！\n\n"
-                        "是否自动将所有修改的文件（data.pack / 加速 EXE）\n"
-                        "替换到游戏目录中？\n"
-                        "（原文件将备份为 .bak）"
-                    )
-                    if result:
-                        self._auto_replace_pack(_output_dir, self.game_bin_path.get(), _produced_files)
-                    else:
-                        self._log_line("已跳过自动替换，请手动复制文件", "info")
-
-                self.after(0, _ask_replace)
+            self.after(0, _ask_replace)
 
         except InterruptedError:
-            sys.stdout = old_stdout if 'old_stdout' in dir() else sys.__stdout__
             self._log_line("操作已被用户停止", "warn")
             self._set_progress(0, "已停止")
 
         except Exception as e:
-            if 'old_stdout' in dir(): sys.stdout = old_stdout
-            else: sys.stdout = sys.__stdout__
             self._log_line(f"错误: {e}", "error")
-            import traceback
             self._log_line(traceback.format_exc())
             self._set_progress(0, "出错")
-            from tkinter import messagebox
-            self.after(0, lambda: messagebox.showerror("错误", f"处理过程出错:\n{e}"))
+            self.after(0, lambda: messagebox.showerror("错误", f"生成加速 EXE 失败:\n{e}"))
 
         finally:
-            self.is_running = False
-            self.after(0, lambda: self.start_btn.configure(state="normal"))
-            self.after(0, lambda: self.stop_btn.configure(state="disabled"))
+            def _done():
+                self.is_running = False
+                self.ssra_btn.configure(state="normal" if self._can_ssra else "disabled")
+                self.speed_btn.configure(state="normal" if self._can_speed else "disabled")
+                self.stop_btn.configure(state="disabled")
+            self.after(0, _done)
 
-    def _auto_replace_pack(self, output_dir, bin_path, filenames=None):
-        """将输出文件替换到游戏目录，原文件备份为 .bak"""
+    def _auto_replace_bin(self, output_dir):
+        """替换加速 EXE 进游戏目录（.bak 备份）；EXE 在构建后变动（热更新）则拒绝覆盖。"""
         import shutil
-        from tkinter import messagebox
         try:
             self._log_line("开始自动替换...", "step")
-
-            if filenames is None:
-                filenames = os.listdir(output_dir)
-            pack_files = [
-                filename for filename in filenames
-                if os.path.isfile(os.path.join(output_dir, filename))
-            ]
-
-            if not pack_files:
-                self._log_line("输出目录中未找到任何文件!", "error")
+            src = os.path.join(output_dir, GAME_EXE_NAME)
+            target = os.path.join(self.game_bin_path.get(), GAME_EXE_NAME)
+            if not os.path.isfile(src):
+                self._log_line("输出目录中未找到加速 EXE!", "error")
                 return
 
-            self._log_line(f"  找到 {len(pack_files)} 个文件待替换", "info")
-
-            # 游戏 EXE 在构建后被外部改动（如热更新）时拒绝覆盖
-            if GAME_EXE_NAME in pack_files:
-                target_exe = os.path.join(bin_path, GAME_EXE_NAME)
-                if os.path.exists(target_exe):
-                    expected_hash = getattr(self, "_speed_source_sha256", "")
-                    current_hash = self._sha256_file(target_exe)
-                    if expected_hash and current_hash != expected_hash:
-                        raise RuntimeError(
-                            "游戏 EXE 在构建后发生了变化，可能刚完成更新；为避免覆盖新版，请重新检测并生成。"
-                        )
-
-            for fname in pack_files:
-                # Decide destination
-                if fname.startswith("data.pack"):
-                    target_file = os.path.join(bin_path, "appdata", "cznlive", fname)
-                elif fname.startswith("bundle.pack") or fname == GAME_EXE_NAME:
-                    target_file = os.path.join(bin_path, fname)
+            if os.path.exists(target):
+                current_hash = self._sha256_file(target)
+                if self._speed_source_sha256 and current_hash != self._speed_source_sha256:
+                    raise RuntimeError(
+                        "游戏 EXE 在构建后发生了变化，可能刚完成更新；为避免覆盖新版，请重新检测并生成。")
+                bak_file = target + ".bak"
+                # 源是未打补丁的官方 EXE 时，始终刷新备份以保留纯净官方版本
+                if not self._speed_source_was_patched:
+                    if os.path.exists(bak_file):
+                        if self._sha256_file(bak_file) != current_hash:
+                            archived = f"{bak_file}.{time.strftime('%Y%m%d_%H%M%S')}"
+                            shutil.move(bak_file, archived)
+                            self._log_line(f"  归档旧备份: {os.path.basename(archived)}", "info")
+                    self._log_line(f"  备份当前游戏版本: {GAME_EXE_NAME} → {GAME_EXE_NAME}.bak", "info")
+                    shutil.copy2(target, bak_file)
+                elif not os.path.exists(bak_file):
+                    self._log_line(f"  备份: {GAME_EXE_NAME} → {GAME_EXE_NAME}.bak", "info")
+                    shutil.copy2(target, bak_file)
                 else:
-                    target_file = os.path.join(bin_path, fname)
+                    self._log_line(f"  备份已存在: {GAME_EXE_NAME}.bak（跳过）", "info")
 
-                # Backup
-                if os.path.exists(target_file):
-                    bak_file = target_file + ".bak"
-                    # 源是未打补丁的官方 EXE 时，始终刷新备份以保留纯净官方版本
-                    refresh_exe_backup = fname == GAME_EXE_NAME and not getattr(self, "_speed_source_was_patched", False)
-                    if refresh_exe_backup:
-                        if os.path.exists(bak_file):
-                            backup_hash = self._sha256_file(bak_file)
-                            target_hash = self._sha256_file(target_file)
-                            if backup_hash != target_hash:
-                                stamp = time.strftime("%Y%m%d_%H%M%S")
-                                archived_bak = f"{bak_file}.{stamp}"
-                                shutil.move(bak_file, archived_bak)
-                                self._log_line(f"  归档旧备份: {os.path.basename(archived_bak)}", "info")
-                        self._log_line(f"  备份当前游戏版本: {fname} → {fname}.bak", "info")
-                        shutil.copy2(target_file, bak_file)
-                    else:
-                        if not os.path.exists(bak_file):
-                            self._log_line(f"  备份: {fname} → {fname}.bak", "info")
-                            shutil.copy2(target_file, bak_file)
-                        else:
-                            self._log_line(f"  备份已存在: {fname}.bak（跳过）", "info")
+            sz = os.path.getsize(src) / 1024 / 1024
+            self._log_line(f"  替换: {GAME_EXE_NAME} ({sz:.0f} MB)", "step")
+            shutil.copy2(src, target)
 
-                # Copy
-                src = os.path.join(output_dir, fname)
-                sz = os.path.getsize(src) / 1024 / 1024
-                self._log_line(f"  替换: {fname} ({sz:.0f} MB)", "step")
-                shutil.copy2(src, target_file)
-
-            self._log_line(f"✅ 自动替换完成！共替换 {len(pack_files)} 个文件", "ok")
-            messagebox.showinfo("替换完成 ✅", f"已成功替换 {len(pack_files)} 个文件！\n原文件已备份为 .bak")
+            self._log_line("✅ 自动替换完成！", "ok")
+            messagebox.showinfo("替换完成 ✅",
+                                f"已成功替换 {GAME_EXE_NAME}！\n原文件已备份为 .bak")
 
         except Exception as e:
             self._log_line(f"自动替换失败: {e}", "error")
@@ -1683,5 +1634,6 @@ if __name__ == "__main__":
         print("来源: %s" % (from_where or "-"))
         print("总耗时: %.1f ms" % ((time.perf_counter() - t0) * 1000))
         sys.exit(0 if hit else 1)
+    enable_windows_dpi_awareness()
     app = ChaosZeroToolkit()
     app.mainloop()
