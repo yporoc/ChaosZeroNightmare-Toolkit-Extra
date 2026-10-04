@@ -100,9 +100,7 @@ if SCRIPT_DIR not in sys.path:
 
 
 def enable_windows_dpi_awareness():
-    """高分屏清晰渲染：进程级 DPI 感知必须在首个窗口创建前声明。
-    Win8.1+ 走 shcore（系统级感知，多屏缩放差异时由系统拉伸，布局最稳），
-    失败再退 user32（Vista+），都不支持就算了。"""
+    """高分屏清晰渲染：进程级 DPI 感知须在首个窗口创建前声明，shcore 失败退 user32。"""
     if os.name != "nt":
         return
     try:
@@ -115,9 +113,7 @@ def enable_windows_dpi_awareness():
 
 
 def is_windows_admin():
-    """当前进程是否以管理员令牌运行（Win10/Win11 通用）。
-    主路 shell32.IsUserAnAdmin；不可用时退回 GetTokenInformation(TokenElevation)。
-    非 Windows 视为已提权，不影响源码自测。"""
+    """当前进程是否以管理员令牌运行（Win10/Win11 通用，非 Windows 视为已提权）。"""
     if os.name != "nt":
         return True
     try:
@@ -144,9 +140,7 @@ def is_windows_admin():
 
 
 def is_uac_disabled():
-    """EnableLUA=0 = 系统层面关闭了 UAC：没有提权 broker，runas 必然静默失败
-    （点「提权」不会有任何弹窗，实测复现）。此时只能换管理员账户运行或重开 UAC。
-    注意 EnableLUA=0 时管理员账户的进程天生全权令牌，本判断只在未提权时才会被走到。"""
+    """EnableLUA=0 时系统没有提权 broker，runas 必然静默失败（只能换管理员账户或重开 UAC）。"""
     if os.name != "nt":
         return False
     try:
@@ -668,7 +662,7 @@ class ChaosZeroToolkit(ctk.CTk):
             text_color=COLOR_TEXT_DIM
         ).pack(side="left", padx=(0, 10), pady=15)
 
-        # 提权状态常驻标题栏：未提权时芯片即按钮，点击直接申请管理员
+        # 未提权时芯片即提权按钮
         if is_windows_admin():
             ctk.CTkLabel(
                 bar, text="✓ 管理员运行",
@@ -698,7 +692,7 @@ class ChaosZeroToolkit(ctk.CTk):
             fg_color="transparent", hover_color=COLOR_BG_CARD,
             text_color="#FFFFFF", border_width=1, border_color=COLOR_BORDER,
             font=ctk.CTkFont(family=GLOBAL_FONT[0], size=13, weight="bold"),
-            command=lambda: self._open_url("https://github.com/NineS11942/ChaosZeroYuna-Engine-Unpacker-Simplified-Chinese-Localization-Patch")
+            command=lambda: self._open_url("https://github.com/yporoc/ChaosZeroNightmare-Toolkit-Extra")
         )
         github_btn.pack(side="right", padx=4, pady=15)
 
@@ -936,8 +930,7 @@ class ChaosZeroToolkit(ctk.CTk):
     # 日志工具
     # ═══════════════════════════════════════════════════════════════
     def _log(self, text):
-        """线程安全日志：先入缓冲，合帧后一次写入控件。
-        长任务每秒可产生上百行，逐行 insert 会刷爆 UI 线程 —— 批量是硬要求。"""
+        """线程安全日志：先入缓冲合帧写入，长任务逐行 insert 会刷爆 UI 线程。"""
         self._log_buf.append(text)
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
@@ -951,7 +944,7 @@ class ChaosZeroToolkit(ctk.CTk):
         self._log_buf.clear()
         self.log_text.configure(state="normal")
         self.log_text.insert("end", chunk)
-        # 行数上限：超限裁头部，防长时间运行内存与渲染膨胀
+        # 行数上限：超限裁头部，防内存与渲染膨胀
         lines = int(self.log_text.index("end-1c").split(".")[0])
         if lines > 6000:
             self.log_text.delete("1.0", "%d.0" % (lines - 5000))
@@ -1006,12 +999,10 @@ class ChaosZeroToolkit(ctk.CTk):
         self._log_line("正在停止...", "warn")
 
     # ═══════════════════════════════════════════════════════════════
-    # 管理员权限：检测在启动时完成（_elevated）；未提权时所有写入类
-    # 功能执行前走一次醒目提醒，可当场一键提权重启
+    # 管理员权限：未提权时功能执行前醒目提醒，可当场一键提权重启
     # ═══════════════════════════════════════════════════════════════
     def _ensure_admin_or_confirm(self, action):
-        """未提权时执行功能前的醒目提醒。
-        返回 True 表示本次继续；False 表示取消（或已发起提权重启，本实例随即退出）。"""
+        """未提权时执行功能前的醒目提醒。返回 False 表示取消或已转提权重启。"""
         if self._elevated:
             return True
         box = ctk.CTkToplevel(self, fg_color=COLOR_BG_CARD)
@@ -1072,9 +1063,7 @@ class ChaosZeroToolkit(ctk.CTk):
         return False
 
     def _elevate_restart(self):
-        """以管理员身份重新启动本工具（触发 UAC），成功后退出当前实例。
-        用 ShellExecuteExW 而非 ShellExecuteW：失败时拿得到确切 Win32 错误码，
-        「点了没反应」永远有诊断出口。"""
+        """以管理员身份重启本工具（触发 UAC），成功后退出当前实例；失败返回确切错误码。"""
         if self.is_running:
             self._log_line("任务进行中，请等完成或停止后再提权重启", "warn")
             return False
@@ -1108,7 +1097,7 @@ class ChaosZeroToolkit(ctk.CTk):
         info.lpVerb = "runas"            # 触发 UAC；已提权进程则静默通过
         info.lpFile = exe
         info.lpParameters = params or None
-        # lpDirectory 传工具目录：提权后实例的工作目录不变，配置与日志仍落在同一处
+        # lpDirectory 固定工具目录，提权后配置与日志落点不变
         info.lpDirectory = EXE_DIR
         info.nShow = 1                   # SW_SHOWNORMAL
 
@@ -1358,8 +1347,7 @@ class ChaosZeroToolkit(ctk.CTk):
         exe_path = os.path.join(bin_path, GAME_EXE_NAME)
         exe_found = os.path.isfile(exe_path)
 
-        # 1.5 内嵌注入脚本随 EXE 自释放（打包后在临时解压目录），不占检测区；
-        # 只作为加速生成的前置条件在后台确认，缺失时才提示
+        # 内嵌脚本随 EXE 自释放，不占检测区；仅作生成前置，缺失才提示
         embedded_js_dir, embedded_js_error = self._get_embedded_js_dir()
         speed_assets_found = bool(embedded_js_dir)
         if not speed_assets_found:
@@ -1393,7 +1381,7 @@ class ChaosZeroToolkit(ctk.CTk):
                 self._set_status(key, "✗ 未找到", False)
                 self._log_line(f"未找到 {title}: {p}", "warn")
 
-        # 繁转简与加速生成任一可用即可；能力位记住，任务结束后按位恢复按钮状态
+        # 繁转简与加速生成任一可用即可；能力位记下，任务结束后按位恢复按钮
         self._can_ssra = ssra_found == len(targets)
         self._can_speed = exe_found and speed_assets_found
         self.ssra_btn.configure(state="normal" if self._can_ssra else "disabled")
@@ -1587,8 +1575,7 @@ class ChaosZeroToolkit(ctk.CTk):
             self.after(0, _done)
 
     def _auto_replace_bin(self, output_dir):
-        """把生成的加速 EXE 替换进游戏目录；原文件备份 .bak。
-        游戏 EXE 在构建后被外部改动（如热更新）时拒绝覆盖，避免打坏新版。"""
+        """替换加速 EXE 进游戏目录（.bak 备份）；EXE 在构建后变动（热更新）则拒绝覆盖。"""
         import shutil
         try:
             self._log_line("开始自动替换...", "step")
