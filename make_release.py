@@ -48,26 +48,17 @@ PYINSTALLER_ARGS = [
 
 RELEASE_NOTES = """卡厄斯梦境（Chaos Zero Nightmare）汉化与游戏内变速工具 —— 社区维护版（GPLv3）。
 
-本 Release 同时提供**预编译工具**与**完整源码**。
-
-## 本版新增
-- **界面全面重整**：现代卡片式布局，就绪检测五芯片一目了然；日志合帧批量刷新，长时间任务不再卡顿；高分屏（Win10/11 显示缩放）清晰渲染。
-- **管理员助手**：启动时检测当前权限并在标题栏常驻显示；未提权时执行功能前会醒目提醒，可一键以管理员身份重启工具，无需右键「以管理员身份运行」。
-- **退役 data.pack 时代汉化线**：游戏资源已迁移到 ssra 体系，旧 data.pack 韩译/繁转简/本地 TSV 流程与翻译文本库一并移除；**繁转简（ssra）成为唯一汉化路径**。
-- **繁转简（ssra）**：提取官方繁中 text.db → OpenCC 转简 → 与官方逐字节同尺寸重建分卷并应用；自动备份、可一键还原；同步补丁器身份记录，patching 不再要求重新下载。
-- 源码运行时可走命令行：`python ssra_zhcn.py <gameres目录> build|apply|restore|status`
-
-## 下载
-| 文件 | 说明 |
-|---|---|
-| `ChaosZeroNightmare-Toolkit-Extra-v{ver}.zip` | 预编译工具（解压即用，含 `LICENSE`） |
-| `Source code (zip)` / `Source code (tar.gz)` | 本 tag 的完整源码（由 GitHub 现场生成） |
+## 本版（v2.0.4fix2）
+- **界面全面重整**：卡片式布局、就绪检测芯片、日志合帧刷新、高分屏清晰渲染；功能收敛为「繁转简（ssra）」与「生成加速 EXE」。
+- **管理员助手**：未提权时执行功能前醒目提醒，可一键以管理员重启；UAC 被系统关闭时给出指引。
+- **退役 data.pack 汉化旧线**，繁转简（ssra）为唯一汉化路径。
 
 ## 使用
-1. 解压后运行 `ChaosZero-Toolkit.exe`（未提权时工具会提示并可直接申请管理员）
-2. 定位游戏目录（`bin` 或其上层），检测区确认所需文件均为 ✓
-3. 「繁转简」：构建完成后选「是」应用；「生成加速 EXE」：生成后选择自动替换（原文件备份为 .bak）
-4. 启动游戏，patching 正常通过，游戏内显示简体中文；再次运行工具可还原官方繁中
+1. 解压到游戏目录 `ChaosZeroNightmare` 所在目录，运行 `ChaosZero-Toolkit.exe`（未提权时可直接申请管理员）
+2. 「繁转简」应用后启动游戏即见简体中文；「生成加速 EXE」替换后生效（原文件自动备份为 .bak）
+3. 游戏内 `F9` 加速 · `F10` 复位 · `F11` 跳过动画 · `F12` 显隐 · `F8` 回主界面；按键在 `speed_config.txt` 自定义
+
+源码与说明：https://github.com/yporoc/ChaosZeroNightmare-Toolkit-Extra
 """
 
 
