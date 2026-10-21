@@ -25,10 +25,10 @@ Features:
   - Progress bar and statistics
 
 Usage:
-  python unpack_data.py                          # unpack to default output dir
-  python unpack_data.py -o ./unpacked             # custom output dir
-  python unpack_data.py --list                   # list files without extracting
-  python unpack_data.py --filter "text/"         # only extract files matching filter
+  python unpack_data.py -d "<游戏目录>/bin/appdata/cznlive"        # 解到默认输出目录
+  python unpack_data.py -d "<...>/cznlive" -o ./out                # 自定义输出目录
+  python unpack_data.py -d "<...>/cznlive" --list                  # 只列文件不解出
+  python unpack_data.py -d "<...>/cznlive" --filter "text/"        # 只解匹配到的路径
 """
 import struct, os, sys, time, argparse
 import numpy as np
@@ -36,7 +36,7 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════
-GAME_DIR = os.path.join('F:', os.sep, 'Games', 'ChaosZeroNightmare', 'bin', 'appdata', 'cznlive')   # 按需修改
+# 资源目录不预置任何机器路径，必须用 -d 指定
 DEFAULT_OUT = './unpacked'
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -403,8 +403,8 @@ def progress_bar(current, total, width=40, prefix='', suffix=''):
 
 def main():
     parser = argparse.ArgumentParser(description='ChaosZero Nightmare data.pack Unpacker')
-    parser.add_argument('-d', '--dir', default=GAME_DIR,
-                        help=f'Pack directory (default: {GAME_DIR})')
+    parser.add_argument('-d', '--dir', required=True,
+                        help='资源目录（游戏 bin/appdata/cznlive），必填')
     parser.add_argument('-o', '--output', default=DEFAULT_OUT,
                         help=f'Output directory (default: {DEFAULT_OUT})')
     parser.add_argument('--list', action='store_true',
