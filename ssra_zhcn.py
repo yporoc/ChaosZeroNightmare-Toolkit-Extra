@@ -8,11 +8,15 @@
   manifest.ssra 文件记录 = 40B[路径哈希,组内偏移,压缩/解压尺寸,...,压缩方法,组号]
   .ssrc 分卷 = 16B 对齐条目(zstd 帧或裸文件) + 16B footer['SSRC',卷号,XXH64(载荷)]
   text.db = PLPcK v1，值结构 '<id>\\0<文本>\\0'，.db 存储态带 256B 内层 XOR（相位逐文件固定）
+  text.db 明文末尾可能还有一段官方页脚（build 84/88 为 0 字节，build 126 实测 38 字节且以
+  'PLPcK' 魔数开头、内含条目数与桶数），重建时必须原样带回，否则解压尺寸与清单 dec 不符。
   启动器用 manifest.ssra.etag 里的 XXH64+size 校验本地 manifest，必须同步更新。
 """
-import os
-import struct
 import collections
+import json
+import os
+import shutil
+import struct
 
 import xxhash
 import zstandard as zstd
@@ -21,10 +25,14 @@ from opencc import OpenCC
 from unpack_data import INNER_XOR_KEY
 
 TEXT_DB = 'text/zht/text.db'
-TARGET_PART = 'lang_zht_b03_0.ssrc'
+TARGET_PART = 'lang_zht_b03_0.ssrc'   # 历史卷名，仅用于提示；实际卷由清单决定
 ETAG_REL = 'manifest.ssra.etag'
-PREV_REL = 'manifest.ssra.prev'
 BACKUP_SUBDIR = 'backup_original'
+IDENTITY_FILE = 'identity.json'
+
+
+class ZhcnError(Exception):
+    """前提不成立时的可执行停机：消息里必须说清"下一步该怎么办"。"""
 
 
 def _inner_decrypt(data, phase):
@@ -158,6 +166,12 @@ def parse_textdb(data):
     return data[:43], hash_count, buckets, entries
 
 
+def trailing_bytes(data, entries):
+    """最后一个条目之后、明文结尾之前的原样字节（官方页脚，可能是 0 长度）。"""
+    end = max((e[3] + 15 + len(e[0]) + len(e[1]) for e in entries), default=len(data))
+    return data[end:]
+
+
 def rebuild_textdb(header, hash_count, buckets, entries, new_values):
     nxt = {}
     for lst in buckets:
@@ -222,28 +236,51 @@ def convert_values(entries, stats):
 
 def build(gameres, out_dir, log=print):
     """构建补丁到 out_dir，返回 (manifest_path, part_path)。"""
-    S = Ssra(gameres)
-    log('manifest build=%d parts=%d files=%d' % (S.build, S.part_count, S.file_count))
-    f = S.record(TEXT_DB)
-    part_k = [k for idx, k, s, e in S.gcum[f['grp']][1] if s <= f['off'] < e][0]
-    part_name = S.part_names[part_k]
-    assert part_name == TARGET_PART
-    orig_part = open(os.path.join(S.chunk_dir, part_name), 'rb').read()
-    local = f['off'] - [s for idx, k, s, e in S.gcum[f['grp']][1] if k == part_k][0]
-    assert orig_part[local:local + 4] == b'\x28\xb5\x2f\xfd'
-    assert orig_part[local + f['comp']:len(orig_part) - 16].strip(b'\x00') == b'', 'text.db 不是该卷最后条目'
+    S, f, part_name, (part_idx, part_k, part_start, part_end) = locate_target(gameres)
+    log('manifest build=%d parts=%d files=%d 目标 %s 在 %s' %
+        (S.build, S.part_count, S.file_count, TEXT_DB, part_name))
+    if part_name != TARGET_PART:
+        log('提示: %s 现在 %s 卷里（历史卷名 %s），已按清单动态处理'
+            % (TEXT_DB, part_name, TARGET_PART))
+    if f['meth'] != 1:
+        raise ZhcnError('%s 的压缩方法变成 meth=%d（不再是 zstd 帧），垫帧等长打法不适用；'
+                        '要先搞清新的封装方式才能继续' % (TEXT_DB, f['meth']))
+    if f['off'] + f['comp'] > part_end:
+        raise ZhcnError('%s 跨了分卷边界（结束 %d > 卷内上界 %d），等长改写不成立；'
+                        '这一版需要整组重建分卷，本工具暂未实现该路径'
+                        % (TEXT_DB, f['off'] + f['comp'], part_end))
+    part_path = os.path.join(S.chunk_dir, part_name)
+    if not os.path.isfile(part_path):
+        raise ZhcnError('分卷不在盘上：%s\n请先启动游戏把繁中资源下完，再做繁转简' % part_path)
+    orig_part = open(part_path, 'rb').read()
+    local = f['off'] - part_start
+    if orig_part[local:local + 4] != b'\x28\xb5\x2f\xfd':
+        raise ZhcnError('%s 在卷内偏移 %d 处不是 zstd 帧头（实得 %r），官方改了条目封装方式，'
+                        '需要重新逆向' % (TEXT_DB, local, orig_part[local:local + 4]))
+    gap = orig_part[local + f['comp']:len(orig_part) - 16]
+    if gap.strip(b'\x00'):
+        raise ZhcnError('%s 之后同一卷里还有别的条目（实测 %d 个非零字节），改它的长度会挤动后续条目；'
+                        '这一版需要整组重建分卷，本工具暂未实现该路径'
+                        % (TEXT_DB, len(gap.strip(b'\x00'))))
 
     enc = S.extract(TEXT_DB, decrypt=False)
     phase = _find_phase(enc[:64])
-    assert phase is not None, '未找到内层 XOR 相位'
+    if phase is None:
+        raise ZhcnError('在 %s 明文头里找不到内层 XOR 相位（前 64 字节 %r），'
+                        '官方改了 .db 的加密方式，需要重新逆向' % (TEXT_DB, enc[:16]))
     plain = _inner_decrypt(enc, phase)
     log('text.db 解密: phase=%d size=%d' % (phase, len(plain)))
 
     header, hash_count, buckets, entries = parse_textdb(plain)
+    tail = trailing_bytes(plain, entries)
+    # 自证：一条都不转的重建必须逐字节还原官方明文，否则后面所有产出都不可信
+    assert rebuild_textdb(header, hash_count, buckets, entries, {}) + tail == plain, \
+        '重建器无法逐字节还原官方 text.db，结构假设已失效'
+    log('重建自证通过: 尾部原样字节 %d' % len(tail))
     stats = collections.Counter()
     new_values = convert_values(entries, stats)
     log('转换统计: %s' % dict(stats))
-    newdb = rebuild_textdb(header, hash_count, buckets, entries, new_values)
+    newdb = rebuild_textdb(header, hash_count, buckets, entries, new_values) + tail
     # 自检：键集/桶分配/期望值逐条一致
     h2, hc2, b2, e2 = parse_textdb(newdb)
     assert len(e2) == len(entries) and hc2 == hash_count
@@ -265,17 +302,26 @@ def build(gameres, out_dir, log=print):
     # 因此帧压缩到不超过原始 comp 尺寸，再用标准 zstd skippable frame 垫满，
     # manifest 里只允许 XXH64 一个字段与官方不同。
     orig_comp, orig_dec = f['comp'], f['dec']
-    assert len(newdb) == orig_dec, '转换改变了 text.db 尺寸（%d != %d），会破坏分卷尺寸一致性' % (
-        len(newdb), orig_dec)
+    if len(newdb) != orig_dec:
+        grow = [i for i, v in new_values.items() if len(v) != len(entries[i][1])]
+        raise ZhcnError('转换后 text.db 尺寸变了 %+d 字节（%d -> %d），其中 %d 条值的字节长度被 t2s 改动；'
+                        '等长改写不成立，得先定新的填充策略' %
+                        (len(newdb) - orig_dec, orig_dec, len(newdb), len(grow)))
     newdb_enc = _inner_decrypt(newdb, phase)
+    # skippable frame 自己要占 8 字节头，所以余量只能是 0 或 >=8；
+    # 1~7 字节属于"这一档压不出可用余量"，要换档而不是硬垫。
     frame = None
+    tried = []
     for lvl in (3, 6, 9, 12, 16, 19):
         cand = zstd.ZstdCompressor(level=lvl).compress(newdb_enc)
-        if len(cand) <= orig_comp:
-            frame = cand
+        pad_total = orig_comp - len(cand)
+        tried.append('%d:%+d' % (lvl, pad_total))
+        if pad_total == 0 or pad_total >= 8:
+            frame, pad_total = cand, pad_total
             break
-    assert frame is not None, '无法压缩到原始帧尺寸以内'
-    pad_total = orig_comp - len(frame)
+    if frame is None:
+        raise ZhcnError('简体内容压不进官方帧尺寸（各档余量 %s，需要 0 或 >=8 字节），'
+                        '等长改写不成立，得整组重建分卷' % ' '.join(tried))
     if pad_total:
         n = pad_total - 8
         frame += b'\x50\x2a\x4d\x18' + struct.pack('<I', n) + b'\x00' * n
@@ -286,31 +332,180 @@ def build(gameres, out_dir, log=print):
 
     payload = orig_part[:local] + frame + orig_part[local + orig_comp:len(orig_part) - 16]
     assert len(payload) == len(orig_part) - 16
-    part_idx = [idx for idx, k, s, e in S.gcum[f['grp']][1] if k == part_k][0]
     new_part = payload + b'SSRC' + struct.pack('<I', part_idx) + \
         struct.pack('<Q', xxhash.xxh64(payload).intdigest())
     assert len(new_part) == len(orig_part), '分卷尺寸与官方不一致'
 
-    man = bytearray(open(os.path.join(gameres, 'manifest.ssra'), 'rb').read())
+    man_src = open(os.path.join(gameres, 'manifest.ssra'), 'rb').read()
+    man = bytearray(man_src)
     o = 0x40 + part_k * 32
     old_a, old_b = struct.unpack_from('<QQ', man, o + 8)
     assert (len(new_part) - 16, len(new_part)) == (old_a, old_b), '分卷尺寸字段意外变化'
-    struct.pack_into('<Q', man, o + 24, xxhash.xxh64(new_part[:-16]).intdigest())
+    struct.pack_into('<Q', man, o + 24, _xxh(new_part[:-16]))
     man = bytes(man)
 
     os.makedirs(out_dir, exist_ok=True)
     open(os.path.join(out_dir, 'manifest.ssra'), 'wb').write(man)
-    open(os.path.join(out_dir, TARGET_PART), 'wb').write(new_part)
-    log('补丁已生成: manifest.ssra(%d) %s(%d)' % (len(man), part_name, len(new_part)))
-    return os.path.join(out_dir, 'manifest.ssra'), os.path.join(out_dir, TARGET_PART)
+    open(os.path.join(out_dir, part_name), 'wb').write(new_part)
+    ident = {
+        'build': S.build,
+        'context': patch_context(gameres),
+        'part': part_name,
+        'official': {'manifest': _xxh(man_src), 'manifest_size': len(man_src),
+                     'part': _xxh(orig_part[:-16]), 'part_size': len(orig_part)},
+        'patched': {'manifest': _xxh(man), 'manifest_size': len(man),
+                    'part': _xxh(new_part[:-16]), 'part_size': len(new_part)},
+        'text_db': {'comp': orig_comp, 'dec': orig_dec, 'entries': len(entries),
+                    'converted': len(new_values), 'tail': len(tail), 'phase': phase},
+    }
+    json.dump(ident, open(os.path.join(out_dir, IDENTITY_FILE), 'w', encoding='utf-8'),
+              ensure_ascii=False, indent=1)
+    log('补丁已生成: manifest.ssra(%d) %s(%d) 身份 build=%s 卷哈希 %s -> %s' %
+        (len(man), part_name, len(new_part), S.build,
+         ident['official']['part'], ident['patched']['part']))
+    return os.path.join(out_dir, 'manifest.ssra'), os.path.join(out_dir, part_name)
 
 
 def _etag_lines(path):
     return open(path, 'rb').read().split(b'\r\n')
 
 
+def _xxh(b):
+    return xxhash.xxh64(b).intdigest()
+
+
+def _bak_name(rel):
+    return rel.replace('\\', '__').replace('/', '__') + '.bak'
+
+
+def patch_context(gameres):
+    p = os.path.join(gameres, 'patch-complete.json')
+    if not os.path.isfile(p):
+        return ''
+    return json.loads(open(p, 'rb').read()).get('context', '')
+
+
+def live_identity(gameres):
+    """现场资源树的身份：清单哈希/尺寸 + build（清单头里的 build_number）。"""
+    man = open(os.path.join(gameres, 'manifest.ssra'), 'rb').read()
+    return {'manifest': _xxh(man), 'manifest_size': len(man),
+            'build': struct.unpack_from('<I', man, 8)[0],
+            'context': patch_context(gameres)}
+
+
+def live_part_identity(gameres, part):
+    p = os.path.join(gameres, 'chunks', part)
+    if not os.path.isfile(p):
+        raise ZhcnError('分卷不在盘上：%s\n请先启动游戏把繁中资源下完，再做繁转简' % p)
+    d = open(p, 'rb').read()
+    return {'part': _xxh(d[:-16]), 'part_size': len(d)}
+
+
+def backup_tag(ident):
+    ctx = ident.get('context') or 'nocontext'
+    safe = ''.join(c if (c.isalnum() or c in '._-') else '_' for c in ctx)
+    return 'b%s-%s' % (ident['build'], safe)
+
+
+def load_identity(patch_dir):
+    p = os.path.join(patch_dir, IDENTITY_FILE) if patch_dir else ''
+    if not p or not os.path.isfile(p):
+        return None
+    d = json.loads(open(p, 'rb').read())
+    for k in ('build', 'part', 'official', 'patched'):
+        if k not in d:
+            raise ZhcnError('%s 缺少字段 %r，身份记录不完整' % (p, k))
+    return d
+
+
+def require_identity(patch_dir):
+    ident = load_identity(patch_dir)
+    if ident is None:
+        raise ZhcnError('补丁目录缺少 %s，无法核对版本身份\n请用当前版本重新构建补丁' % IDENTITY_FILE)
+    return ident
+
+
+def locate_target(gameres):
+    """按清单定位 (Ssra, 文件记录, 卷名, (卷序号, 卷表下标, 卷内起点, 卷内终点))。
+
+    卷名与偏移一律由清单推导，不做硬编码。
+    """
+    S = Ssra(gameres)
+    f = S.record(TEXT_DB)
+    spans = [(idx, k, s, e) for idx, k, s, e in S.gcum[f['grp']][1] if s <= f['off'] < e]
+    if len(spans) != 1:
+        raise ZhcnError('%s 的起点落在 %d 个分卷里，无法定位' % (TEXT_DB, len(spans)))
+    return S, f, S.part_names[spans[0][1]], spans[0]
+
+
+STATE_MISSING = '资源未就绪'
+STATE_UNKNOWN = '未判定'
+STATE_OFFICIAL = '未汉化'
+STATE_PATCHED = '已汉化'
+STATE_STALE = '汉化失效'
+STATE_FOREIGN = '现场异常'
+
+
+def classify(gameres, patch_dir=None, deep=False, log=print):
+    """现场汉化状态，返回 (状态, 说明)。
+
+    快路只读清单头 + 身份记录（几十毫秒，可以待在 UI 线程里）；
+    deep=True 才真的解压 text.db 去数残留繁体条数——那要碰 22MB 和 OpenCC，
+    只能放后台线程，所以默认不做。
+    """
+    if not os.path.isfile(os.path.join(gameres, 'manifest.ssra')):
+        return STATE_MISSING, '没有 manifest.ssra，资源未就绪或路径不对'
+    try:
+        S, f, part, span = locate_target(gameres)
+    except (KeyError, ZhcnError, AssertionError) as e:
+        return STATE_FOREIGN, '清单里找不到 %s：%s' % (TEXT_DB, e)
+    if not os.path.isfile(os.path.join(gameres, 'chunks', part)):
+        return STATE_MISSING, '分卷 %s 不在盘上，请先让游戏下完繁中资源' % part
+    live = live_identity(gameres)
+    ident = load_identity(patch_dir)
+    if ident:
+        off, pat = ident['official'], ident['patched']
+        if part != ident['part']:
+            return STATE_STALE, ('%s 现在在 %s 卷里，补丁记录的是 %s——官方把繁中文本挪了卷，'
+                                 '重新点一次繁转简即可' % (TEXT_DB, part, ident['part']))
+        lp = live_part_identity(gameres, part)
+        man_off = (live['manifest'], live['manifest_size']) == (off['manifest'], off['manifest_size'])
+        man_pat = (live['manifest'], live['manifest_size']) == (pat['manifest'], pat['manifest_size'])
+        part_off = (lp['part'], lp['part_size']) == (off['part'], off['part_size'])
+        part_pat = (lp['part'], lp['part_size']) == (pat['part'], pat['part_size'])
+        if man_pat and part_pat:
+            n = ident.get('text_db', {}).get('converted')
+            return STATE_PATCHED, '已汉化（build %s，%s 条已转简，清单与分卷身份都对得上）' % (
+                live['build'], n)
+        if man_off and part_off:
+            return STATE_OFFICIAL, '官方态（build %s），还没汉化' % live['build']
+        if ident['build'] != live['build']:
+            return STATE_STALE, ('补丁是给 build %s 做的，现场已是 build %s——资源更新把汉化冲掉了，'
+                                 '重新点一次繁转简即可' % (ident['build'], live['build']))
+        if man_off and part_pat:
+            return STATE_FOREIGN, '清单是官方态但分卷还是补丁件（%s）——按"重新繁转简"可自动纠正' % part
+        if man_pat and part_off:
+            return STATE_FOREIGN, '清单还是补丁件但分卷已被换回官方（%s）——汉化实际已失效' % part
+        return STATE_FOREIGN, '现场清单/分卷与补丁记录都不符，请先让游戏更新一轮资源再重建补丁'
+    if not deep:
+        return STATE_UNKNOWN, 'build %s，本目录还没有补丁身份记录，无法只凭清单判定' % live['build']
+    try:
+        plain = S.extract(TEXT_DB)
+        entries = parse_textdb(plain)[3]
+    except (ZhcnError, AssertionError) as e:
+        return STATE_FOREIGN, '读 %s 失败：%s' % (TEXT_DB, e)
+    n = len(convert_values(entries, collections.Counter()))
+    if n == 0:
+        return STATE_PATCHED, 'build %s，文本已无繁体残留（%d 条）' % (live['build'], len(entries))
+    return STATE_OFFICIAL, 'build %s，还有 %d 条是繁体待转简' % (live['build'], n)
+
+
 def sync_identity(gameres, log=print):
-    """把 etag 身份记录(XXH64+size)同步为当前 manifest；.prev 也指向当前 manifest。"""
+    """把 etag 身份记录(XXH64+size)同步为当前 manifest。
+
+    只动 etag 的第 3/4 行。manifest.ssra.prev 是更新器自己维护的"上一版清单"，
+    我们既不写也不删——盖上去会让更新器的差分合成拿到一个假基线。
+    """
     man_path = os.path.join(gameres, 'manifest.ssra')
     man = open(man_path, 'rb').read()
     etag = os.path.join(gameres, ETAG_REL)
@@ -318,42 +513,276 @@ def sync_identity(gameres, log=print):
     lines[2] = str(xxhash.xxh64(man).intdigest()).encode()
     lines[3] = str(len(man)).encode()
     open(etag, 'wb').write(b'\r\n'.join(lines))
-    open(os.path.join(gameres, PREV_REL), 'wb').write(man)
     log('身份记录已同步: hash=%s size=%s' % (lines[2].decode(), lines[3].decode()))
 
 
 def apply(gameres, patch_dir, log=print):
-    # 分卷在 gameres 下位于 chunks/ 子目录，补丁目录里则是平铺文件名
-    items = [('manifest.ssra', 'manifest.ssra'),
-             (os.path.join('chunks', TARGET_PART), TARGET_PART)]
-    bd = os.path.join(patch_dir, BACKUP_SUBDIR)
+    """按身份应用补丁：现场必须与补丁记录的官方态逐字节对得上，否则拒绝。
+
+    备份按 build+context 分子目录，并且每次都用已核实为官方态的现场重写——
+    这样就不可能再把"已打过补丁的卷"存成"原件"（历史上三份脏原件就是这么来的）。
+    """
+    ident = require_identity(patch_dir)
+    part = ident['part']
+    pfile = os.path.join(patch_dir, part)
+    if not os.path.isfile(pfile):
+        raise ZhcnError('补丁目录里缺分卷 %s，补丁不完整\n请重新构建补丁' % pfile)
+    live = live_identity(gameres)
+    if live['build'] != ident['build']:
+        raise ZhcnError('现场是 build %s，这个补丁是给 build %s 做的\n请重新构建补丁'
+                        % (live['build'], ident['build']))
+    off, pat = ident['official'], ident['patched']
+    if (live['manifest'], live['manifest_size']) == (pat['manifest'], pat['manifest_size']):
+        log('现场已经是这个补丁的结果（build %s），无需重复应用' % live['build'])
+        return
+    if (live['manifest'], live['manifest_size']) != (off['manifest'], off['manifest_size']):
+        raise ZhcnError('现场清单与补丁记录的官方清单不符：现场 %s/%d，记录 %s/%d\n'
+                        '多半是游戏又更新了，请重新构建补丁再应用'
+                        % (live['manifest'], live['manifest_size'],
+                           off['manifest'], off['manifest_size']))
+    lp = live_part_identity(gameres, part)
+    if (lp['part'], lp['part_size']) != (off['part'], off['part_size']):
+        raise ZhcnError('现场分卷 %s 不是补丁记录的那个官方件：现场 %s/%d，记录 %s/%d\n'
+                        '拒绝备份，否则会把非官方卷当成"原件"存下来'
+                        % (part, lp['part'], lp['part_size'], off['part'], off['part_size']))
+    bd = os.path.join(patch_dir, BACKUP_SUBDIR, backup_tag(ident))
     os.makedirs(bd, exist_ok=True)
-    for rel, pname in items:
-        assert os.path.isfile(os.path.join(patch_dir, pname)), pname
-    for rel, pname in items + [(ETAG_REL, ETAG_REL)]:
+    for rel in ('manifest.ssra', os.path.join('chunks', part), ETAG_REL):
         src = os.path.join(gameres, rel)
-        dst = os.path.join(bd, rel.replace(chr(92), '__').replace('/', '__') + '.bak')
-        if os.path.isfile(src) and not os.path.isfile(dst):
-            open(dst, 'wb').write(open(src, 'rb').read())
-            log('备份 %s' % rel)
-    for rel, pname in items:
-        open(os.path.join(gameres, rel), 'wb').write(
-            open(os.path.join(patch_dir, pname), 'rb').read())
+        if not os.path.isfile(src):
+            raise ZhcnError('要备份的文件不存在：%s' % src)
+        open(os.path.join(bd, _bak_name(rel)), 'wb').write(open(src, 'rb').read())
+        log('备份 %s -> %s' % (rel, os.path.join(bd, _bak_name(rel))))
+    json.dump(ident, open(os.path.join(bd, IDENTITY_FILE), 'w', encoding='utf-8'),
+              ensure_ascii=False, indent=1)
+    for rel, src in (('manifest.ssra', os.path.join(patch_dir, 'manifest.ssra')),
+                     (os.path.join('chunks', part), pfile)):
+        open(os.path.join(gameres, rel), 'wb').write(open(src, 'rb').read())
         log('应用 %s' % rel)
+    after = live_identity(gameres)
+    ap = live_part_identity(gameres, part)
+    if (after['manifest'], after['manifest_size'], ap['part'], ap['part_size']) != (
+            pat['manifest'], pat['manifest_size'], pat['part'], pat['part_size']):
+        raise ZhcnError('应用后回读身份与补丁记录不符，现场可能没写成功：现场清单 %s/%d，记录 %s/%d'
+                        % (after['manifest'], after['manifest_size'],
+                           pat['manifest'], pat['manifest_size']))
+    log('应用后身份核对通过: build=%s 卷=%s' % (after['build'], part))
     sync_identity(gameres, log)
 
 
 def restore(gameres, patch_dir, log=print):
-    bd = os.path.join(patch_dir, BACKUP_SUBDIR)
-    for rel in (os.path.join('chunks', TARGET_PART), 'manifest.ssra', ETAG_REL):
-        bak = os.path.join(bd, rel.replace(chr(92), '__').replace('/', '__') + '.bak')
-        assert os.path.isfile(bak), bak
+    """只还原"现场能对上身份"的那一份备份，对不上就拒绝写。"""
+    broot = os.path.join(patch_dir, BACKUP_SUBDIR)
+    if not os.path.isdir(broot):
+        raise ZhcnError('没有备份目录 %s，无法还原' % broot)
+    idents = {}
+    for tag in sorted(os.listdir(broot)):
+        p = os.path.join(broot, tag, IDENTITY_FILE)
+        if os.path.isfile(p):
+            idents[tag] = json.loads(open(p, 'rb').read())
+    if not idents:
+        raise ZhcnError('备份目录 %s 里没有带版本身份的备份（旧版备份不含身份，不敢拿来还原）\n'
+                        '要回官方态，最稳的是让游戏自己更新一轮资源' % broot)
+    live = live_identity(gameres)
+    chosen = None
+    for tag, ident in idents.items():
+        pat, off = ident['patched'], ident['official']
+        if (live['manifest'], live['manifest_size'], live['build']) == (
+                pat['manifest'], pat['manifest_size'], ident['build']):
+            chosen = (tag, ident)
+            break
+        if (live['manifest'], live['manifest_size'], live['build']) == (
+                off['manifest'], off['manifest_size'], ident['build']):
+            log('现场已是 build %s 的官方态，无需还原' % live['build'])
+            return
+    if chosen is None:
+        raise ZhcnError('现场清单（build %s, %s/%d）与任何一份带身份的备份都对不上，拒绝写入。\n'
+                        '备份里有: %s' % (live['build'], live['manifest'], live['manifest_size'],
+                                          sorted(idents)))
+    tag, ident = chosen
+    bd = os.path.join(broot, tag)
+    part = ident['part']
+    off = ident['official']
+    for rel in ('manifest.ssra', os.path.join('chunks', part), ETAG_REL):
+        bak = os.path.join(bd, _bak_name(rel))
+        if not os.path.isfile(bak):
+            raise ZhcnError('备份缺文件 %s' % bak)
         open(os.path.join(gameres, rel), 'wb').write(open(bak, 'rb').read())
         log('还原 %s' % rel)
-    prev = os.path.join(gameres, PREV_REL)
-    if os.path.isfile(prev):
-        os.remove(prev)
-        log('移除 ' + PREV_REL)
+    after = live_identity(gameres)
+    ap = live_part_identity(gameres, part)
+    if (after['manifest'], after['manifest_size'], ap['part'], ap['part_size']) != (
+            off['manifest'], off['manifest_size'], off['part'], off['part_size']):
+        raise ZhcnError('还原后身份与官方记录不符，请人工检查 %s：现场清单 %s/%d，官方记录 %s/%d'
+                        % (bd, after['manifest'], after['manifest_size'],
+                           off['manifest'], off['manifest_size']))
+    log('还原后身份核对通过: build=%s 卷=%s' % (after['build'], part))
+
+
+def official_input_tree(gameres, patch_dir, workdir, log=print):
+    """现场不是官方态时，用本工具自己留下的、且被身份记录核实过的备份铺一棵官方态输入树。
+
+    铺不出来就返回 None（自检会直接说明前提不成立，绝不拿脏件当官方态跑分）。
+    """
+    broot = os.path.join(patch_dir, BACKUP_SUBDIR) if patch_dir else ''
+    if not os.path.isdir(broot):
+        return None
+    live = live_identity(gameres)
+    for tag in sorted(os.listdir(broot), reverse=False):
+        p = os.path.join(broot, tag, IDENTITY_FILE)
+        if not os.path.isfile(p):
+            continue
+        ident = json.loads(open(p, 'rb').read())
+        if ident['build'] != live['build']:
+            continue
+        pat = ident['patched']
+        if (live['manifest'], live['manifest_size']) != (pat['manifest'], pat['manifest_size']):
+            continue          # 现场连补丁态都不是 ⇒ 不是"已汉化"，不值得铺
+        part = ident['part']
+        bak_man = os.path.join(broot, tag, _bak_name('manifest.ssra'))
+        bak_part = os.path.join(broot, tag, _bak_name(os.path.join('chunks', part)))
+        bak_etag = os.path.join(broot, tag, _bak_name(ETAG_REL))
+        if not (os.path.isfile(bak_man) and os.path.isfile(bak_part)):
+            continue
+        d = os.path.join(workdir, 'official_input')
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(os.path.join(d, 'chunks'))
+        man = open(bak_man, 'rb').read()
+        prt = open(bak_part, 'rb').read()
+        # 备份里存的必须正是身份记录所说的官方件，否则不给用
+        if (_xxh(man), len(man), _xxh(prt[:-16]), len(prt)) != (
+                ident['official']['manifest'], ident['official']['manifest_size'],
+                ident['official']['part'], ident['official']['part_size']):
+            log('备份 %s 与身份记录不符，不拿来当官方态输入' % tag)
+            continue
+        open(os.path.join(d, 'manifest.ssra'), 'wb').write(man)
+        open(os.path.join(d, 'chunks', part), 'wb').write(prt)
+        if os.path.isfile(bak_etag):
+            open(os.path.join(d, ETAG_REL), 'wb').write(open(bak_etag, 'rb').read())
+        for extra in ('patch-complete.json', 'manifest.ssra.prev'):
+            src = os.path.join(gameres, extra)
+            if os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(d, extra))
+        log('现场已是汉化态，改用备份 %s 铺出的官方态输入做自检：%s' % (tag, d))
+        return d, ident
+    return None
+
+
+def selftest(gameres, workdir, patch_dir=None, log=print):
+    """无头自检：产出补丁并把它读回来验，全程不写游戏目录。
+
+    返回 [(判据名, 是否通过, 证据), ...]。每条都是"读产物/读现场"得出的，
+    不是"没抛异常"就算过。
+    """
+    res = []
+
+    def chk(name, ok, evi=''):
+        res.append((name, bool(ok), str(evi)))
+        log('%-4s %s %s' % ('PASS' if ok else 'FAIL', name, evi))
+
+    S, f, part, (part_idx, part_k, part_start, part_end) = locate_target(gameres)
+    chk('G1 清单定位目标', True, 'build=%s files=%d 卷=%s off=%d comp=%d dec=%d' %
+        (S.build, S.file_count, part, f['off'], f['comp'], f['dec']))
+    man_live = open(os.path.join(gameres, 'manifest.ssra'), 'rb').read()
+    d = os.path.join(gameres, 'chunks', part)
+    if not os.path.isfile(d):
+        chk('G2 目标分卷在盘', False, d)
+        return res
+    part_live = open(d, 'rb').read()
+    live_part_hash = _xxh(part_live[:-16])
+    rec_hash = [p[5] for p in S.parts if p[2] == part_k][0]
+    chk('G2 目标分卷在盘且哈希与清单记录一致', live_part_hash == rec_hash,
+        'disk=%d 记录=%s 实=%s（不一致=现场已是补丁态或被人改过）' % (len(part_live), rec_hash,
+                                                                       live_part_hash))
+    used_backup = None
+    shutil.rmtree(workdir, ignore_errors=True)
+    os.makedirs(workdir, exist_ok=True)
+    plain_off = S.extract(TEXT_DB)
+    entries_off = parse_textdb(plain_off)[3]
+    tail_off = trailing_bytes(plain_off, entries_off)
+    if not convert_values(entries_off, collections.Counter()):
+        # 现场没繁体可转：多半是已经汉化过。改用它自己的已核实备份铺官方态输入。
+        got = official_input_tree(gameres, patch_dir, workdir, log)
+        if not got:
+            chk('G0 自检输入必须有繁体可转', False,
+                '现场 %s 已无繁体可转（多半是已经汉化过）；请在官方态资源上跑，或先还原再自检' % TEXT_DB)
+            return res
+        used_backup, ident_live = got
+        S, f, part, (part_idx, part_k, part_start, part_end) = locate_target(used_backup)
+        gameres = used_backup
+        man_live = open(os.path.join(gameres, 'manifest.ssra'), 'rb').read()
+        part_live = open(os.path.join(gameres, 'chunks', part), 'rb').read()
+        plain_off = S.extract(TEXT_DB)
+        entries_off = parse_textdb(plain_off)[3]
+        tail_off = trailing_bytes(plain_off, entries_off)
+        chk('G0 备份铺出的官方态输入可用',
+            (_xxh(man_live), len(man_live), _xxh(part_live[:-16]), len(part_live)) ==
+            (ident_live['official']['manifest'], ident_live['official']['manifest_size'],
+             ident_live['official']['part'], ident_live['official']['part_size']),
+            'build=%s 官方卷=%s' % (S.build, ident_live['official']['part']))
+    out = os.path.join(workdir, 'patch')
+    build(gameres, out, log=lambda m: log('      ' + str(m)))
+    pf = os.path.join(out, part)
+    part_new = open(pf, 'rb').read()
+    chk('G3 产物分卷与官方等长', len(part_new) == len(part_live),
+        '%d vs %d' % (len(part_new), len(part_live)))
+    man_new = open(os.path.join(out, 'manifest.ssra'), 'rb').read()
+    diff = [i for i in range(len(man_new)) if man_new[i] != man_live[i]]
+    fld = list(range(0x40 + part_k * 32 + 24, 0x40 + part_k * 32 + 32))
+    chk('G4 清单只差该卷 XXH64 一处', diff and set(diff) <= set(fld),
+        '差异 %d 字节，位置=%s，允许=%s' % (len(diff), diff[:4], fld[0]))
+    ident = require_identity(out)
+    chk('G5 身份记录与产物实测一致',
+        (ident['patched']['part'], ident['patched']['part_size'], ident['official']['part']) ==
+        (_xxh(part_new[:-16]), len(part_new), _xxh(part_live[:-16])),
+        'build=%s 官方卷=%s 补丁卷=%s' % (ident['build'], ident['official']['part'],
+                                          ident['patched']['part']))
+
+    # 回环：用候选清单 + 候选卷搭一棵只读树，按真读者的路径读回来
+    rt = os.path.join(workdir, 'roundtrip')
+    os.makedirs(os.path.join(rt, 'chunks'))
+    shutil.copyfile(os.path.join(out, 'manifest.ssra'), os.path.join(rt, 'manifest.ssra'))
+    shutil.copyfile(pf, os.path.join(rt, 'chunks', part))
+    S2 = Ssra(rt)
+    plain_new = S2.extract(TEXT_DB)
+    entries_new = parse_textdb(plain_new)[3]
+    tail_new = trailing_bytes(plain_new, entries_new)
+    chk('G6 候选卷能被真读者解析', len(plain_new) == f['dec'] and plain_new[:5] == b'PLPcK',
+        '解压=%d dec=%d' % (len(plain_new), f['dec']))
+    n_trad = len(convert_values(entries_new, collections.Counter()))
+    chk('G7 回读后繁体残留为 0', n_trad == 0, '残留=%d' % n_trad)
+    chk('G8 条目数与键集不变',
+        len(entries_new) == len(entries_off) and
+        {e[0] for e in entries_new} == {e[0] for e in entries_off},
+        '官方=%d 回读=%d' % (len(entries_off), len(entries_new)))
+    chk('G9 尾部页脚原样带回', tail_new == tail_off and len(tail_new) == len(tail_off),
+        '官方尾=%d 回读尾=%d' % (len(tail_off), len(tail_new)))
+    expect = convert_values(entries_off, collections.Counter())
+    exp_by_key = {entries_off[i][0]: v for i, v in expect.items()}
+    off_by_key = {e[0]: e[1] for e in entries_off}
+    new_by_key = {e[0]: e[1] for e in entries_new}
+    wrong = [k[:32] for k, v in new_by_key.items() if v != exp_by_key.get(k, off_by_key[k])]
+    chk('G10 逐条值对账（转过的等于转换结果，没转的一字未改）',
+        not wrong and len(new_by_key) == len(entries_off),
+        '不符=%d %s 期望改动=%d 键数=%d/%d' % (len(wrong), wrong[:2], len(expect),
+                                                len(new_by_key), len(entries_off)))
+    import io
+    local = f['off'] - part_start
+    enc_off = S.extract(TEXT_DB, decrypt=False)
+    phase = _find_phase(enc_off[:64])
+    got = zstd.ZstdDecompressor().stream_reader(
+        io.BytesIO(part_new[local:local + f['comp']]), read_across_frames=True).read()
+    want = _inner_decrypt(plain_new, phase)
+    chk('G11 候选帧可整帧流式回读成候选明文', got == want,
+        'phase=%s got=%d want=%d' % (phase, len(got), len(want)))
+    if used_backup:
+        # 三方对账：本次由官方件重建的补丁 == 现场正在用的补丁 == 身份记录所说的补丁
+        chk('G12 重建补丁与现场在用补丁同哈希',
+            _xxh(part_new[:-16]) == live_part_hash == ident_live['patched']['part'],
+            '重建=%s 现场=%s 记录=%s' % (_xxh(part_new[:-16]), live_part_hash,
+                                          ident_live['patched']['part']))
+    shutil.rmtree(workdir, ignore_errors=True)
+    return res
 
 
 def status(gameres, patch_dir, log=print):
