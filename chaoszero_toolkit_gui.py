@@ -83,7 +83,7 @@ COPY_HINT_TOKENS = ("desktop", "downloads", "onedrive", "appdata", "sandbox",
                     "副本", "备份", "copy", "-old", "_old", "backup", "\\bak")
 SETTINGS_NAME = "toolkit_settings.json"
 
-APP_VERSION = "2.0.4fix2"
+APP_VERSION = "2.0.5"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 打包后，exe 实际运行目录（而非临时解压目录）
@@ -621,6 +621,7 @@ class ChaosZeroToolkit(ctk.CTk):
         self._speed_source_was_patched = False
         self._can_ssra = False
         self._can_speed = False
+        self._zhcn_deep_busy = False
         self._log_buf = []
         self._log_flush_scheduled = False
 
@@ -779,14 +780,15 @@ class ChaosZeroToolkit(ctk.CTk):
 
         grid = ctk.CTkFrame(frame, fg_color="transparent")
         grid.pack(fill="x", padx=15, pady=(0, 15))
-        grid.columnconfigure((0, 1, 2, 3), weight=1)
+        grid.columnconfigure((0, 1, 2, 3, 4), weight=1)
 
         self.status_labels = {}
         indicators = [
             ("exe", "游戏启动器 EXE", "等待检测"),
             ("manifest", "manifest.ssra", "等待检测"),
-            ("part", "lang_zht_b03_0.ssrc", "等待检测"),
+            ("part", "繁中分卷", "等待检测"),
             ("etag", "manifest.ssra.etag", "等待检测"),
+            ("zhcn", "汉化状态", "等待检测"),
         ]
         for col, (key, title, default) in enumerate(indicators):
             card = ctk.CTkFrame(grid, fg_color="#313244", corner_radius=6,
@@ -1360,12 +1362,18 @@ class ChaosZeroToolkit(ctk.CTk):
             self._set_status("exe", "✗ 未找到", False)
             self._log_line(f"未找到 {GAME_EXE_NAME}，请确认路径正确", "warn")
 
-        # 2. 检查 ssra 资源（繁转简的三个目标文件）
+        # 2. 检查 ssra 资源（繁转简的三个目标文件；卷名按清单解析，不写死）
         gameres = os.path.join(bin_path, "appdata", "cznlive", "gameres")
         self.gameres_dir = gameres
+        part_name = "lang_zht_b03_0.ssrc"
+        try:
+            import ssra_zhcn
+            part_name = ssra_zhcn.locate_target(gameres)[2]
+        except Exception as e:
+            self._log_line("繁中分卷名未能由清单解析，按历史卷名检查 %s：%s" % (part_name, e), "info")
         targets = (
             ("manifest", "manifest.ssra", "manifest.ssra"),
-            ("part", "lang_zht_b03_0.ssrc", os.path.join("chunks", "lang_zht_b03_0.ssrc")),
+            ("part", part_name, os.path.join("chunks", part_name)),
             ("etag", "manifest.ssra.etag", "manifest.ssra.etag"),
         )
         ssra_found = 0
@@ -1387,6 +1395,11 @@ class ChaosZeroToolkit(ctk.CTk):
         self.ssra_btn.configure(state="normal" if self._can_ssra else "disabled")
         self.speed_btn.configure(state="normal" if self._can_speed else "disabled")
 
+        # 汉化状态：先走快路（只读清单头与补丁身份，几十毫秒），判不出再后台深扫
+        state = self._refresh_zhcn_state(gameres)
+        if self._can_ssra and state == ssra_zhcn.STATE_UNKNOWN:
+            threading.Thread(target=self._classify_deep, args=(gameres,), daemon=True).start()
+
         if self._can_ssra and self._can_speed:
             self._log_line("检测完成：繁转简与加速 EXE 均可用！", "ok")
         elif self._can_ssra:
@@ -1395,6 +1408,49 @@ class ChaosZeroToolkit(ctk.CTk):
             self._log_line("检测完成，可以生成加速 EXE！", "ok")
         else:
             self._log_line("检测完成，部分条件不满足，请检查", "warn")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 汉化状态读数
+    # ═══════════════════════════════════════════════════════════════
+    def _patch_dir(self):
+        return os.path.join(EXE_DIR, "zhcn_patch")
+
+    def _refresh_zhcn_state(self, gameres, deep=False):
+        """把汉化状态写进"就绪检测"的第五张卡，返回状态码（供调用方决定是否深扫）。
+
+        快路只读清单头 + 补丁身份记录；deep=True 才会解压 text.db 去数残留繁体。
+        """
+        try:
+            import ssra_zhcn
+        except Exception as e:
+            self._set_status("zhcn", "模块缺失", False)
+            self._log_line("汉化状态检测不可用: %s" % e, "warn")
+            return None
+        try:
+            state, note = ssra_zhcn.classify(gameres, self._patch_dir(), deep=deep,
+                                             log=lambda m: None)
+        except Exception as e:
+            state, note = ssra_zhcn.STATE_FOREIGN, "状态检测失败: %s" % e
+        if state == ssra_zhcn.STATE_PATCHED:
+            ok, level = True, "ok"
+        elif state in (ssra_zhcn.STATE_OFFICIAL, ssra_zhcn.STATE_UNKNOWN):
+            ok, level = None, "info"
+        else:
+            ok, level = False, "warn"
+        self._set_status("zhcn", state, ok)
+        self._log_line("汉化状态：%s —— %s" % (state, note), level)
+        return state
+
+    def _classify_deep(self, gameres):
+        """后台深扫：本目录还没有补丁身份记录时，用现场文本直接判定。"""
+        if self._zhcn_deep_busy:
+            return
+        self._zhcn_deep_busy = True
+        try:
+            self._log_line("正在后台核对现场文本（要解压 text.db 并逐条比对，约十几秒）…", "info")
+            self._refresh_zhcn_state(gameres, deep=True)
+        finally:
+            self._zhcn_deep_busy = False
 
     # ═══════════════════════════════════════════════════════════════
     # 繁转简（ssra）
@@ -1414,8 +1470,9 @@ class ChaosZeroToolkit(ctk.CTk):
         if not messagebox.askyesno(
                 "繁转简（ssra）",
                 "将把官方繁中 text.db 转为简体并应用到游戏。\n\n"
-                "• 原文件自动备份，可随时还原\n"
-                "• 同步补丁器身份记录，避免启动时要求重新下载\n\n"
+                "• 原文件按游戏版本自动备份，可随时还原\n"
+                "• 只同步补丁器身份记录；官方资源更新后汉化会被换回官方件，"
+                "重新点一次本按钮即可\n\n"
                 "继续？"):
             return
         self.is_running = True
@@ -1429,7 +1486,7 @@ class ChaosZeroToolkit(ctk.CTk):
     def _run_ssra_zhcn(self, gameres):
         try:
             import ssra_zhcn
-            patch_dir = os.path.join(EXE_DIR, "zhcn_patch")
+            patch_dir = self._patch_dir()
             log = lambda m: self._log_line("  " + m)
             self._set_progress(0.3, "繁转简：构建中...")
             ssra_zhcn.build(gameres, patch_dir, log=log)
@@ -1447,6 +1504,7 @@ class ChaosZeroToolkit(ctk.CTk):
                         self._log_line("已应用，启动游戏即可看到简体中文", "ok")
                     else:
                         self._log_line("已跳过应用，补丁保留在 " + patch_dir, "info")
+                    self._refresh_zhcn_state(gameres)
                     self._set_progress(1.0, "繁转简完成！")
                 except Exception as e:
                     self._log_line(f"应用失败: {e}", "error")
@@ -1634,6 +1692,51 @@ if __name__ == "__main__":
         print("来源: %s" % (from_where or "-"))
         print("总耗时: %.1f ms" % ((time.perf_counter() - t0) * 1000))
         sys.exit(0 if hit else 1)
+    if "--zhcn-selftest" in sys.argv:
+        # 无头自检：构建补丁 + 把产物读回来验，全程不写游戏目录
+        # --noconsole 打包后 stdout 会落空，所以逐条同时写进 zhcn_selftest.txt
+        import ssra_zhcn
+        lines = []
+
+        def say(m):
+            lines.append(str(m))
+            try:
+                print(m)
+            except Exception:
+                pass
+
+        gr = next((a for a in sys.argv[1:] if not a.startswith("-")), "")
+        if not gr:
+            hit, _, _ = locate_game_bin()
+            if not hit:
+                say("没定位到游戏 bin 目录；可直接传 gameres 路径："
+                    "ChaosZero-Toolkit.exe --zhcn-selftest <...\\gameres>")
+            else:
+                gr = os.path.join(hit, "appdata", "cznlive", "gameres")
+        if gr:
+            say("gameres = %s" % gr)
+            t0 = time.perf_counter()
+            code = 1
+            try:
+                gates = ssra_zhcn.selftest(gr, os.path.join(EXE_DIR, "zhcn_selftest"),
+                                           patch_dir=os.path.join(EXE_DIR, "zhcn_patch"),
+                                           log=say)
+                bad = [g for g in gates if not g[1]]
+                say("判据 %d 条，失败 %d 条，耗时 %.1fs" %
+                    (len(gates), len(bad), time.perf_counter() - t0))
+                # 判据为空也必须算失败，不许"没跑到"被读成"全绿"
+                code = 1 if (bad or not gates) else 0
+            except Exception as e:
+                say("自检异常: %r" % e)
+                say(traceback.format_exc())
+                code = 1
+            try:
+                with open(os.path.join(EXE_DIR, "zhcn_selftest.txt"), "w", encoding="utf-8") as fp:
+                    fp.write("\n".join(lines) + "\n")
+            except Exception:
+                pass
+            sys.exit(code)
+        sys.exit(2)
     enable_windows_dpi_awareness()
     app = ChaosZeroToolkit()
     app.mainloop()
